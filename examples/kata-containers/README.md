@@ -4,6 +4,107 @@ Run OpenShell sandboxes inside Kata Container VMs for hardware-level
 isolation on Kubernetes.  This example covers Kata setup, custom sandbox
 images, policy authoring, and sandbox creation with `runtimeClassName`.
 
+## Architecture
+
+```mermaid
+graph TB
+  subgraph userMachine [Developer Machine]
+    CLI["openshell CLI"]
+    PySDK["Python SDK"]
+    DockerBuild["Docker"]
+  end
+
+  subgraph k8sCluster [Kubernetes Cluster]
+    subgraph controlPlane [Control Plane Components]
+      GW["OpenShell Gateway<br/>StatefulSet - port 8080"]
+      DB["SQLite / PostgreSQL"]
+      CRD["Sandbox CRD<br/>agents.x-k8s.io/v1"]
+      Controller["agent-sandbox-controller<br/>Reconciles CR to Pod"]
+      RC["RuntimeClass<br/>kata-containers"]
+      KataDeploy["kata-deploy DaemonSet<br/>Installs Kata on nodes"]
+    end
+
+    subgraph workerNode [Worker Node]
+      Containerd["containerd"]
+      KataRT["Kata runtime<br/>QEMU / Cloud Hypervisor"]
+      SupervisorBin["/opt/openshell/bin/<br/>openshell-sandbox"]
+      InstallerDS["supervisor-installer<br/>DaemonSet"]
+
+      subgraph kataVM [Kata MicroVM - dedicated guest kernel]
+        subgraph sandboxPod [Sandbox Pod]
+          Supervisor["openshell-sandbox<br/>supervisor process"]
+
+          subgraph isolationLayers [OpenShell Isolation Layers]
+            Landlock["Landlock LSM<br/>filesystem rules"]
+            SeccompBPF["seccomp-BPF<br/>syscall filter"]
+            NetNS["Network Namespace<br/>veth 10.200.0.0/24"]
+          end
+
+          subgraph netEnforce [Network Enforcement]
+            Proxy["HTTP CONNECT Proxy<br/>:3128"]
+            OPAEngine["OPA / Rego Engine<br/>per-binary policy"]
+            L7["L7 Inspector<br/>REST / TLS terminate"]
+            InfRouter["Inference Router<br/>inference.local"]
+          end
+
+          AgentProc["AI Agent<br/>Claude Code / OpenClaw /<br/>Hermes / Codex"]
+          SSHServer["Embedded SSH Server<br/>:2222"]
+        end
+      end
+    end
+  end
+
+  subgraph external [External Services]
+    APIs["Allowed APIs<br/>Anthropic / GitHub / npm"]
+    BlockedEP["Blocked endpoints<br/>policy denied"]
+    LLM["LLM Backends<br/>Ollama / vLLM"]
+  end
+
+  CLI -->|"gRPC + mTLS"| GW
+  PySDK -->|"gRPC + mTLS<br/>runtime_class_name"| GW
+  CLI -->|"SSH tunnel"| SSHServer
+  DockerBuild -->|"build + push image"| Containerd
+
+  GW --> DB
+  GW -->|"creates Sandbox CR"| CRD
+  CRD --> Controller
+  Controller -->|"creates Pod with<br/>runtimeClassName"| RC
+  RC --> KataRT
+  KataRT -->|"boots VM"| kataVM
+
+  InstallerDS -->|"copies binary"| SupervisorBin
+  SupervisorBin -->|"hostPath + virtiofs"| Supervisor
+
+  Supervisor --> Landlock
+  Supervisor --> SeccompBPF
+  Supervisor --> NetNS
+  Supervisor --> Proxy
+  Supervisor --> SSHServer
+  Supervisor -->|"spawns"| AgentProc
+
+  AgentProc -->|"all egress via netns"| Proxy
+  Proxy --> OPAEngine
+  OPAEngine -->|"allow"| L7
+  OPAEngine -->|"deny"| BlockedEP
+  L7 --> APIs
+  Proxy --> InfRouter
+  InfRouter --> LLM
+
+  GW -->|"provider credentials<br/>via placeholder"| Supervisor
+  GW -->|"policy YAML<br/>hot-reload"| Supervisor
+```
+
+Three layers of isolation protect your infrastructure:
+
+1. **Kata VM** -- each sandbox pod runs inside its own QEMU/Cloud Hypervisor
+   microVM with a dedicated guest kernel, providing hardware-level isolation.
+2. **OpenShell sandbox** -- inside the VM, the supervisor enforces Landlock
+   filesystem rules, seccomp-BPF syscall filters, and a dedicated network
+   namespace.
+3. **Egress proxy and OPA** -- all outbound traffic passes through an HTTP
+   CONNECT proxy that evaluates per-binary, per-endpoint network policy via
+   an embedded OPA/Rego engine.
+
 ## Prerequisites
 
 - A Kubernetes cluster (v1.26+) with admin access

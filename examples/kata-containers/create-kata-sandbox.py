@@ -53,7 +53,7 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
-        from openshell._proto import openshell_pb2, openshell_pb2_grpc
+        from openshell._proto import openshell_pb2
     except ImportError:
         print(
             "error: openshell package not installed. "
