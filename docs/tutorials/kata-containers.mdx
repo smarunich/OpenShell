@@ -236,6 +236,15 @@ Wait for rollout:
 oc -n openshell rollout status daemonset/openshell-supervisor-installer
 ```
 
+Relabel the binary on every node so SELinux allows containers to execute it:
+
+```shell
+for node in $(oc get nodes -o jsonpath='{.items[*].metadata.name}'); do
+  oc debug node/$node -- chroot /host \
+    chcon -t container_file_t /opt/openshell/bin/openshell-sandbox
+done
+```
+
 ## Deploy the Agent-Sandbox CRD
 
 Install the Sandbox Custom Resource Definition and its controller:
@@ -319,6 +328,7 @@ spec:
     - localhost
   ipAddresses:
     - 127.0.0.1
+    - <NODE_IP>
   usages:
     - server auth
     - digital signature
@@ -389,7 +399,7 @@ allowHostDirVolumePlugin: true
 allowHostNetwork: false
 allowHostPID: false
 allowHostPorts: false
-allowPrivilegedContainer: false
+allowPrivilegedContainer: true
 allowedCapabilities:
   - SYS_ADMIN
   - NET_ADMIN
@@ -399,7 +409,9 @@ readOnlyRootFilesystem: false
 runAsUser:
   type: RunAsAny
 seLinuxContext:
-  type: RunAsAny
+  type: MustRunAs
+  seLinuxOptions:
+    type: spc_t
 fsGroup:
   type: RunAsAny
 supplementalGroups:
@@ -421,6 +433,83 @@ oc adm policy add-scc-to-user openshell-sandbox \
   -z default -n openshell
 ```
 
+## Grant the Gateway SCC
+
+The gateway pod runs as uid 1000 with `fsGroup: 1000`. Grant the `anyuid` SCC to the Helm-created service account so OpenShift admits it:
+
+```shell
+oc adm policy add-scc-to-user anyuid -z openshell -n openshell
+```
+
+## Mirror Images (Air-Gapped Clusters)
+
+If your cluster nodes cannot pull from `ghcr.io`, enable the internal registry and mirror the images. Skip this step if your nodes have direct internet access.
+
+Enable the OpenShift internal registry:
+
+```shell
+oc patch configs.imageregistry.operator.openshift.io cluster \
+  --type merge -p '{"spec":{"managementState":"Managed","storage":{"emptyDir":{}},"defaultRoute":true}}'
+oc -n openshift-image-registry wait --for=condition=Ready pod -l docker-registry=default --timeout=120s
+```
+
+Create a push token and port-forward to the registry:
+
+```shell
+oc apply -f - <<'EOF'
+apiVersion: v1
+kind: Secret
+metadata:
+  name: builder-token
+  namespace: openshell
+  annotations:
+    kubernetes.io/service-account.name: builder
+type: kubernetes.io/service-account-token
+EOF
+
+oc policy add-role-to-user system:image-pusher \
+  system:serviceaccount:openshell:builder -n openshell
+
+sleep 3
+TOKEN=$(oc -n openshell get secret builder-token -o jsonpath='{.data.token}' | base64 -d)
+oc -n openshift-image-registry port-forward svc/image-registry 5000:5000 &
+sleep 3
+```
+
+Mirror the gateway and sandbox images (amd64) using `skopeo`:
+
+```shell
+skopeo copy --override-arch amd64 --override-os linux \
+  --dest-tls-verify=false --dest-creds="unused:$TOKEN" \
+  docker://ghcr.io/nvidia/openshell/gateway:0.0.30 \
+  docker://localhost:5000/openshell/gateway:0.0.30
+
+skopeo copy --override-arch amd64 --override-os linux \
+  --dest-tls-verify=false --dest-creds="unused:$TOKEN" \
+  docker://ghcr.io/nvidia/openshell-community/sandboxes/base:latest \
+  docker://localhost:5000/openshell/sandboxes-base:latest
+
+kill %1
+```
+
+<Note>
+Use `--override-arch amd64` to ensure the correct platform is copied. Without it, `skopeo` may select the host platform (e.g. arm64 on Apple Silicon).
+</Note>
+
+Set the internal image references for the Helm install:
+
+```shell
+GATEWAY_IMAGE=image-registry.openshift-image-registry.svc:5000/openshell/gateway
+SANDBOX_IMAGE=image-registry.openshift-image-registry.svc:5000/openshell/sandboxes-base:latest
+```
+
+If your cluster can pull from `ghcr.io` directly, use the defaults:
+
+```shell
+GATEWAY_IMAGE=ghcr.io/nvidia/openshell/gateway
+SANDBOX_IMAGE=ghcr.io/nvidia/openshell-community/sandboxes/base:latest
+```
+
 ## Install the Gateway via Helm
 
 Determine a node IP for the SSH gateway host:
@@ -435,8 +524,10 @@ Install via Helm:
 ```shell
 helm install openshell deploy/helm/openshell/ \
   --namespace openshell \
+  --set image.repository=$GATEWAY_IMAGE \
+  --set image.tag=0.0.30 \
   --set server.sandboxNamespace=openshell \
-  --set server.sandboxImage=ghcr.io/nvidia/openshell-community/sandboxes/base:latest \
+  --set server.sandboxImage=$SANDBOX_IMAGE \
   --set server.grpcEndpoint=https://openshell.openshell.svc.cluster.local:8080 \
   --set server.sshGatewayHost=$NODE_IP \
   --set server.sshGatewayPort=30051
@@ -448,10 +539,26 @@ Wait for the gateway:
 oc -n openshell rollout status statefulset/openshell --timeout=300s
 ```
 
-Register it with the CLI:
+Register it with the CLI and export the mTLS certificates so the CLI can authenticate:
 
 ```shell
-openshell gateway add --name ocp-kata --endpoint https://$NODE_IP:30051
+openshell gateway add --name ocp-kata https://$NODE_IP:30051
+
+GATEWAY_DIR=~/.config/openshell/gateways/ocp-kata/mtls
+mkdir -p "$GATEWAY_DIR"
+
+oc -n openshell get secret openshell-ca-keypair \
+  -o jsonpath='{.data.ca\.crt}' | base64 -d > "$GATEWAY_DIR/ca.crt"
+oc -n openshell get secret openshell-client-tls \
+  -o jsonpath='{.data.tls\.crt}' | base64 -d > "$GATEWAY_DIR/tls.crt"
+oc -n openshell get secret openshell-client-tls \
+  -o jsonpath='{.data.tls\.key}' | base64 -d > "$GATEWAY_DIR/tls.key"
+```
+
+Verify connectivity:
+
+```shell
+openshell status
 ```
 
 ## Build a Sandbox Image
