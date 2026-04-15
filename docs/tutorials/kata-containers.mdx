@@ -1,35 +1,35 @@
 ---
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-title: "Run Sandboxes in Kata Container VMs"
-sidebar-title: "Kata Containers"
+title: "Run Sandboxes in Kata VMs on OpenShift"
+sidebar-title: "Kata on OpenShift"
 slug: "tutorials/kata-containers"
-description: "Deploy OpenShell sandboxes inside Kata Container VMs on Kubernetes for hardware-level isolation, with step-by-step instructions for Kata setup, gateway deployment, image building, and agent execution."
-keywords: "Generative AI, Cybersecurity, Tutorial, Kata Containers, Sandbox, VM, Kubernetes, Isolation"
+description: "Deploy OpenShell sandboxes inside Kata Container VMs on OpenShift for hardware-level isolation, using the OpenShift sandboxed containers operator, gateway deployment via Helm, and agent execution."
+keywords: "Generative AI, Cybersecurity, Tutorial, Kata Containers, Sandbox, VM, OpenShift, Kubernetes, Isolation"
 ---
 
-Run OpenShell sandboxes inside Kata Container VMs on Kubernetes. Each sandbox pod runs in its own lightweight VM with a dedicated guest kernel, adding hardware-level isolation on top of OpenShell's Landlock, seccomp, and network namespace enforcement.
+Run OpenShell sandboxes inside Kata Container VMs on OpenShift. Each sandbox pod runs in its own lightweight VM with a dedicated guest kernel, adding hardware-level isolation on top of OpenShell's seccomp, network namespace, and egress policy enforcement.
 
 After completing this tutorial you will have:
 
-- Kata Containers installed and verified on your Kubernetes cluster.
+- The OpenShift sandboxed containers operator installed with Kata enabled on all worker nodes.
 - The OpenShell gateway deployed via Helm with the supervisor binary on every node.
 - A custom sandbox image with your AI agent baked in.
 - A running sandbox inside a Kata VM with network policy enforcement.
 
 ## Prerequisites
 
-- A Kubernetes cluster (v1.26+) with admin access.
-- Nodes with hardware virtualization support (Intel VT-x / AMD-V).
-- `kubectl`, `helm` v3, and Docker installed locally.
+- An OpenShift cluster (4.14+) with `cluster-admin` access.
+- Nodes with hardware virtualization support (Intel VT-x / AMD-V). Bare-metal or nested-virt enabled VMs.
+- `oc` / `kubectl`, `helm` v3, and `podman` or Docker installed locally.
 - OpenShell CLI installed. See the [Quickstart](/get-started/quickstart) if you have not installed it yet.
 
 ## Architecture
 
 Three layers of isolation protect your infrastructure:
 
-1. **Kata VM** -- each sandbox pod runs inside a QEMU or Cloud Hypervisor microVM with its own guest kernel.
-2. **OpenShell sandbox** -- inside the VM, the supervisor enforces Landlock filesystem rules, seccomp-BPF syscall filters, and a dedicated network namespace.
+1. **Kata VM** -- each sandbox pod runs inside a QEMU microVM with its own guest kernel.
+2. **OpenShell sandbox** -- inside the VM, the supervisor enforces seccomp-BPF syscall filters and a dedicated network namespace with veth pairs and iptables rules.
 3. **Egress proxy and OPA** -- all outbound traffic passes through an HTTP CONNECT proxy that evaluates per-binary, per-endpoint network policy via an embedded OPA/Rego engine.
 
 ```mermaid
@@ -37,22 +37,22 @@ graph TB
   subgraph userMachine [Developer Machine]
     CLI["openshell CLI"]
     PySDK["Python SDK"]
-    DockerBuild["Docker"]
+    PodmanBuild["podman / Docker"]
   end
 
-  subgraph k8sCluster [Kubernetes Cluster]
+  subgraph ocpCluster [OpenShift Cluster]
     subgraph controlPlane [Control Plane Components]
       GW["OpenShell Gateway<br/>StatefulSet - port 8080"]
-      DB["SQLite / PostgreSQL"]
+      DB["SQLite"]
       CRD["Sandbox CRD<br/>agents.x-k8s.io/v1"]
       Controller["agent-sandbox-controller<br/>Reconciles CR to Pod"]
-      RC["RuntimeClass<br/>kata-containers"]
-      KataDeploy["kata-deploy DaemonSet<br/>Installs Kata on nodes"]
+      RC["RuntimeClass: kata<br/>OpenShift sandboxed containers"]
+      OSCOperator["Sandboxed Containers<br/>Operator + KataConfig"]
     end
 
-    subgraph workerNode [Worker Node]
-      Containerd["containerd"]
-      KataRT["Kata runtime<br/>QEMU / Cloud Hypervisor"]
+    subgraph workerNode [Worker Node - RHCOS]
+      CRIO["CRI-O"]
+      KataRT["Kata runtime<br/>QEMU"]
       SupervisorBin["/opt/openshell/bin/<br/>openshell-sandbox"]
       InstallerDS["supervisor-installer<br/>DaemonSet"]
 
@@ -61,7 +61,6 @@ graph TB
           Supervisor["openshell-sandbox<br/>supervisor process"]
 
           subgraph isolationLayers [OpenShell Isolation Layers]
-            Landlock["Landlock LSM<br/>filesystem rules"]
             SeccompBPF["seccomp-BPF<br/>syscall filter"]
             NetNS["Network Namespace<br/>veth 10.200.0.0/24"]
           end
@@ -89,19 +88,18 @@ graph TB
   CLI -->|"gRPC + mTLS"| GW
   PySDK -->|"gRPC + mTLS<br/>runtime_class_name"| GW
   CLI -->|"SSH tunnel"| SSHServer
-  DockerBuild -->|"build + push image"| Containerd
+  PodmanBuild -->|"build + push image"| CRIO
 
   GW --> DB
   GW -->|"creates Sandbox CR"| CRD
   CRD --> Controller
-  Controller -->|"creates Pod with<br/>runtimeClassName"| RC
+  Controller -->|"creates Pod with<br/>runtimeClassName: kata"| RC
   RC --> KataRT
   KataRT -->|"boots VM"| kataVM
 
   InstallerDS -->|"copies binary"| SupervisorBin
   SupervisorBin -->|"hostPath + virtiofs"| Supervisor
 
-  Supervisor --> Landlock
   Supervisor --> SeccompBPF
   Supervisor --> NetNS
   Supervisor --> Proxy
@@ -122,54 +120,120 @@ graph TB
 
 <Steps toc={true}>
 
-## Install Kata Containers
+## Install the Sandboxed Containers Operator
 
-kata-deploy is a DaemonSet that installs Kata binaries and configures containerd on every node.
+OpenShift uses the **sandboxed containers operator** from the Red Hat catalog instead of upstream `kata-deploy`. The operator installs Kata binaries via MachineConfig and reboots nodes one at a time.
 
-```shell
-kubectl apply -f https://raw.githubusercontent.com/kata-containers/kata-containers/main/tools/packaging/kata-deploy/kata-rbac/base/kata-rbac.yaml
-kubectl apply -f https://raw.githubusercontent.com/kata-containers/kata-containers/main/tools/packaging/kata-deploy/kata-deploy/base/kata-deploy.yaml
-kubectl -n kube-system wait --for=condition=Ready pod -l name=kata-deploy --timeout=600s
-```
-
-Verify the RuntimeClass exists:
+Create the operator namespace, OperatorGroup, and Subscription:
 
 ```shell
-kubectl get runtimeclass
+oc create namespace openshift-sandboxed-containers-operator
+
+oc apply -f - <<'EOF'
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  name: sandboxed-containers-operator-group
+  namespace: openshift-sandboxed-containers-operator
+spec:
+  targetNamespaces:
+    - openshift-sandboxed-containers-operator
+EOF
+
+oc apply -f - <<'EOF'
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: sandboxed-containers-operator
+  namespace: openshift-sandboxed-containers-operator
+spec:
+  channel: stable-1.3
+  installPlanApproval: Automatic
+  name: sandboxed-containers-operator
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace
+EOF
 ```
 
-If `kata-containers` is not listed, create it manually. An example manifest is at [examples/kata-containers/kata-runtimeclass.yaml](https://github.com/NVIDIA/OpenShell/blob/main/examples/kata-containers/kata-runtimeclass.yaml):
+Wait for the operator CSV to reach `Succeeded`:
 
 ```shell
-kubectl apply -f examples/kata-containers/kata-runtimeclass.yaml
+oc -n openshift-sandboxed-containers-operator get csv -w
 ```
 
-Confirm Kata works by running a test pod:
+Create the KataConfig CR to deploy Kata on all nodes:
 
 ```shell
-kubectl run kata-test --image=busybox --restart=Never \
-  --overrides='{"spec":{"runtimeClassName":"kata-containers"}}' \
-  -- uname -a
-kubectl wait --for=condition=Ready pod/kata-test --timeout=60s
-kubectl logs kata-test
-kubectl delete pod kata-test
+oc apply -f - <<'EOF'
+apiVersion: kataconfiguration.openshift.io/v1
+kind: KataConfig
+metadata:
+  name: cluster-kataconfig
+spec:
+  kataConfigPoolSelector: null
+EOF
 ```
 
-If the kernel version differs from your host, Kata is working.
+This triggers a MachineConfig rollout that reboots each node one at a time. Monitor progress -- expect 5-8 minutes per node:
+
+```shell
+oc get mcp master -w
+oc get kataconfig cluster-kataconfig \
+  -o jsonpath='completed={.status.installationStatus.completed.completedNodesCount} total={.status.totalNodesCount}'
+```
+
+When all nodes are updated, verify the `kata` RuntimeClass exists:
+
+```shell
+oc get runtimeclass kata
+```
+
+Confirm Kata works with a test pod:
+
+```shell
+oc run kata-test --image=registry.access.redhat.com/ubi9/ubi-minimal:latest \
+  --restart=Never \
+  --overrides='{"spec":{"runtimeClassName":"kata"}}' \
+  -- sh -c "echo 'Kata VM running'; uname -r"
+oc wait --for=condition=Ready pod/kata-test --timeout=120s
+oc logs kata-test
+oc delete pod kata-test
+```
+
+The kernel version in the output is the Kata guest kernel, not the host RHCOS kernel.
 
 ## Deploy the Supervisor Binary
 
-The Kubernetes driver side-loads the `openshell-sandbox` supervisor from `/opt/openshell/bin/openshell-sandbox` on the node via a hostPath volume. For the built-in k3s cluster this is already present. For your own cluster, deploy the installer DaemonSet:
+The Kubernetes driver side-loads the `openshell-sandbox` supervisor from `/opt/openshell/bin/openshell-sandbox` on the node via a hostPath volume. Deploy the installer DaemonSet:
 
 ```shell
-kubectl create namespace openshell
-kubectl apply -f examples/kata-containers/supervisor-daemonset.yaml
+oc create namespace openshell
 ```
 
-Wait for it to roll out:
+On OpenShift, the init container that copies the binary to the host filesystem needs the `privileged` SCC because SELinux blocks writes to hostPath volumes. Create a dedicated service account and grant it the built-in `privileged` SCC:
 
 ```shell
-kubectl -n openshell rollout status daemonset/openshell-supervisor-installer
+oc -n openshell create serviceaccount openshell-supervisor-installer
+oc adm policy add-scc-to-user privileged \
+  -z openshell-supervisor-installer -n openshell
+```
+
+Deploy the DaemonSet, patch it to use the service account, and mark the init container as privileged:
+
+```shell
+oc apply -f examples/kata-containers/supervisor-daemonset.yaml
+
+oc -n openshell patch daemonset openshell-supervisor-installer \
+  -p '{"spec":{"template":{"spec":{"serviceAccountName":"openshell-supervisor-installer"}}}}'
+
+oc -n openshell patch daemonset openshell-supervisor-installer --type=json \
+  -p '[{"op":"add","path":"/spec/template/spec/initContainers/0/securityContext","value":{"privileged":true}}]'
+```
+
+Wait for rollout:
+
+```shell
+oc -n openshell rollout status daemonset/openshell-supervisor-installer
 ```
 
 ## Deploy the Agent-Sandbox CRD
@@ -177,37 +241,196 @@ kubectl -n openshell rollout status daemonset/openshell-supervisor-installer
 Install the Sandbox Custom Resource Definition and its controller:
 
 ```shell
-kubectl apply -f https://raw.githubusercontent.com/NVIDIA/OpenShell/main/deploy/kube/manifests/agent-sandbox.yaml
-kubectl get crd sandboxes.agents.x-k8s.io
-kubectl -n agent-sandbox-system get pods
+oc apply -f https://raw.githubusercontent.com/NVIDIA/OpenShell/main/deploy/kube/manifests/agent-sandbox.yaml
+oc get crd sandboxes.agents.x-k8s.io
+oc -n agent-sandbox-system get pods
 ```
 
-## Create Secrets
+## Install cert-manager
 
-The gateway requires mTLS certificates and an SSH handshake secret. The simplest approach is to bootstrap a local gateway, extract the PKI material, then create Kubernetes secrets:
+The gateway requires mTLS certificates. Use cert-manager to issue and rotate them automatically.
 
 ```shell
-openshell gateway start
-GATEWAY_DIR=$(ls -d ~/.config/openshell/gateways/*/mtls | head -1)
+oc apply -f https://github.com/cert-manager/cert-manager/releases/latest/download/cert-manager.yaml
+oc -n cert-manager wait --for=condition=Ready pod --all --timeout=120s
+```
 
-kubectl -n openshell create secret tls openshell-server-tls \
-  --cert="$GATEWAY_DIR/../server.crt" \
-  --key="$GATEWAY_DIR/../server.key"
+## Create Certificates
 
-kubectl -n openshell create secret generic openshell-server-client-ca \
-  --from-file=ca.crt="$GATEWAY_DIR/ca.crt"
+Create a self-signed CA, an Issuer backed by that CA, and then the server and client Certificates:
 
-kubectl -n openshell create secret tls openshell-client-tls \
-  --cert="$GATEWAY_DIR/client.crt" \
-  --key="$GATEWAY_DIR/client.key"
+```shell
+oc apply -f - <<'EOF'
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: openshell-selfsigned
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: openshell-ca
+  namespace: openshell
+spec:
+  isCA: true
+  commonName: openshell-ca
+  secretName: openshell-ca-keypair
+  duration: 8760h
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+  issuerRef:
+    name: openshell-selfsigned
+    kind: ClusterIssuer
+    group: cert-manager.io
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: openshell-ca-issuer
+  namespace: openshell
+spec:
+  ca:
+    secretName: openshell-ca-keypair
+EOF
 
-kubectl -n openshell create secret generic openshell-ssh-handshake \
+oc -n openshell wait --for=condition=Ready certificate/openshell-ca --timeout=60s
+```
+
+Issue the server certificate (gateway) and client certificate (sandbox pods):
+
+```shell
+oc apply -f - <<'EOF'
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: openshell-server
+  namespace: openshell
+spec:
+  secretName: openshell-server-tls
+  duration: 8760h
+  commonName: openshell
+  dnsNames:
+    - openshell
+    - openshell.openshell.svc
+    - openshell.openshell.svc.cluster.local
+    - localhost
+  ipAddresses:
+    - 127.0.0.1
+  usages:
+    - server auth
+    - digital signature
+    - key encipherment
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+  issuerRef:
+    name: openshell-ca-issuer
+    kind: Issuer
+    group: cert-manager.io
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: openshell-client
+  namespace: openshell
+spec:
+  secretName: openshell-client-tls
+  duration: 8760h
+  commonName: openshell-client
+  usages:
+    - client auth
+    - digital signature
+    - key encipherment
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+  issuerRef:
+    name: openshell-ca-issuer
+    kind: Issuer
+    group: cert-manager.io
+EOF
+
+oc -n openshell wait --for=condition=Ready certificate/openshell-server --timeout=60s
+oc -n openshell wait --for=condition=Ready certificate/openshell-client --timeout=60s
+```
+
+Create the client CA secret (the gateway needs the CA cert to verify client certificates) and the SSH handshake secret:
+
+```shell
+CA_CRT=$(oc -n openshell get secret openshell-ca-keypair -o jsonpath='{.data.ca\.crt}')
+oc -n openshell create secret generic openshell-server-client-ca \
+  --from-literal=ca.crt="$(echo "$CA_CRT" | base64 -d)"
+
+oc -n openshell create secret generic openshell-ssh-handshake \
   --from-literal=secret=$(openssl rand -hex 32)
+```
 
-openshell gateway stop
+Verify all secrets exist:
+
+```shell
+oc -n openshell get certificate
+oc -n openshell get secrets | grep openshell
+```
+
+## Create the Sandbox SCC
+
+Sandbox pods require Linux capabilities (`SYS_ADMIN`, `NET_ADMIN`, `SYS_PTRACE`, `SYSLOG`) and must run as root for the supervisor to set up network namespaces and Landlock enforcement. Create a dedicated SCC:
+
+```shell
+oc apply -f - <<'EOF'
+apiVersion: security.openshift.io/v1
+kind: SecurityContextConstraints
+metadata:
+  name: openshell-sandbox
+allowHostDirVolumePlugin: true
+allowHostNetwork: false
+allowHostPID: false
+allowHostPorts: false
+allowPrivilegedContainer: false
+allowedCapabilities:
+  - SYS_ADMIN
+  - NET_ADMIN
+  - SYS_PTRACE
+  - SYSLOG
+readOnlyRootFilesystem: false
+runAsUser:
+  type: RunAsAny
+seLinuxContext:
+  type: RunAsAny
+fsGroup:
+  type: RunAsAny
+supplementalGroups:
+  type: RunAsAny
+volumes:
+  - hostPath
+  - emptyDir
+  - projected
+  - secret
+  - configMap
+  - persistentVolumeClaim
+EOF
+```
+
+Bind the SCC to the default service account in the sandbox namespace (the gateway creates sandbox pods using this account):
+
+```shell
+oc adm policy add-scc-to-user openshell-sandbox \
+  -z default -n openshell
 ```
 
 ## Install the Gateway via Helm
+
+Determine a node IP for the SSH gateway host:
+
+```shell
+NODE_IP=$(oc get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
+echo "Using node IP: $NODE_IP"
+```
+
+Install via Helm:
 
 ```shell
 helm install openshell deploy/helm/openshell/ \
@@ -215,27 +438,25 @@ helm install openshell deploy/helm/openshell/ \
   --set server.sandboxNamespace=openshell \
   --set server.sandboxImage=ghcr.io/nvidia/openshell-community/sandboxes/base:latest \
   --set server.grpcEndpoint=https://openshell.openshell.svc.cluster.local:8080 \
-  --set server.sshGatewayHost=<YOUR_EXTERNAL_HOST> \
+  --set server.sshGatewayHost=$NODE_IP \
   --set server.sshGatewayPort=30051
 ```
-
-Replace `<YOUR_EXTERNAL_HOST>` with the externally reachable address of your cluster's NodePort or load balancer.
 
 Wait for the gateway:
 
 ```shell
-kubectl -n openshell rollout status statefulset/openshell --timeout=300s
+oc -n openshell rollout status statefulset/openshell --timeout=300s
 ```
 
 Register it with the CLI:
 
 ```shell
-openshell gateway add --name kata-cluster --endpoint https://<YOUR_EXTERNAL_HOST>:30051
+openshell gateway add --name ocp-kata --endpoint https://$NODE_IP:30051
 ```
 
 ## Build a Sandbox Image
 
-Your image provides the agent and its dependencies. OpenShell replaces the entrypoint at runtime with its supervisor, so pass the agent start command after `--` on the CLI. Key requirements:
+Your image provides the agent and its dependencies. OpenShell replaces the entrypoint at runtime with its supervisor. Key requirements:
 
 - Standard Linux base image (not distroless or `FROM scratch`).
 - `iproute2` installed (required for network namespace isolation).
@@ -262,9 +483,9 @@ WORKDIR /sandbox
 Build and push to a registry your cluster can reach:
 
 ```shell
-docker build -t myregistry.com/claude-sandbox:latest \
+podman build -t myregistry.com/claude-sandbox:latest \
   -f examples/kata-containers/Dockerfile.claude-code .
-docker push myregistry.com/claude-sandbox:latest
+podman push myregistry.com/claude-sandbox:latest
 ```
 
 ## Configure a Provider
@@ -285,7 +506,7 @@ The `runtime_class_name` field is fully supported in the gRPC API and Kubernetes
 uv run examples/kata-containers/create-kata-sandbox.py \
   --name my-claude \
   --image myregistry.com/claude-sandbox:latest \
-  --runtime-class kata-containers \
+  --runtime-class kata \
   --provider claude
 ```
 
@@ -297,16 +518,20 @@ openshell sandbox create --name my-claude \
   --provider claude \
   --policy examples/kata-containers/policy-claude-code.yaml
 
-kubectl -n openshell patch sandbox my-claude --type=merge -p '{
+oc -n openshell patch sandbox my-claude --type=merge -p '{
   "spec": {
     "podTemplate": {
       "spec": {
-        "runtimeClassName": "kata-containers"
+        "runtimeClassName": "kata"
       }
     }
   }
 }'
 ```
+
+<Note>
+On OpenShift, the RuntimeClass name is `kata` (created by the sandboxed containers operator), not `kata-containers` as used in upstream Kata deployments.
+</Note>
 
 ## Apply a Network Policy
 
@@ -341,11 +566,11 @@ claude
 Confirm the pod is running with the Kata runtime:
 
 ```shell
-kubectl -n openshell get pods -l sandbox=my-claude \
+oc -n openshell get pods -l sandbox=my-claude \
   -o jsonpath='{.items[0].spec.runtimeClassName}'
 ```
 
-The output should be `kata-containers`.
+The output should be `kata`.
 
 Check the guest kernel version (it should differ from the host):
 
@@ -365,19 +590,35 @@ The network namespace should be listed, the proxy should be listening on port 31
 
 </Steps>
 
-## Kata-Specific Considerations
+## OpenShift-Specific Considerations
+
+### Landlock on RHCOS Kernels
+
+RHCOS ships kernel 5.14.x which predates Landlock ABI V2 (requires 5.19+). The supervisor falls back to seccomp-BPF and network namespace enforcement only. Filesystem isolation via Landlock is not available until RHCOS ships a newer kernel. To suppress warnings, set `landlock.compatibility: best_effort` in your policy YAML.
+
+### Security Context Constraints
+
+OpenShift enforces SCCs rather than PodSecurityPolicies. Sandbox pods need `SYS_ADMIN`, `NET_ADMIN`, `SYS_PTRACE`, and `SYSLOG` capabilities plus `runAsUser: 0`. The `openshell-sandbox` SCC created in this tutorial grants these permissions scoped to the `openshell` namespace's default service account. The supervisor installer DaemonSet has a separate, narrower SCC for hostPath access only.
 
 ### Guest Kernel Requirements
 
-The supervisor requires Landlock (ABI V2, kernel 5.19+), seccomp-BPF, network namespaces, veth, and iptables inside the VM. Most Kata guest kernels 5.15+ include these. If Landlock is unavailable, set `landlock.compatibility: best_effort` in the policy.
+The Kata guest kernel used by the OpenShift sandboxed containers operator is based on the RHCOS host kernel. Verify kernel capabilities inside the VM:
+
+```shell
+oc run kata-check --image=registry.access.redhat.com/ubi9/ubi-minimal:latest \
+  --restart=Never --overrides='{"spec":{"runtimeClassName":"kata"}}' \
+  -- sh -c "uname -r; cat /proc/sys/kernel/seccomp/actions_avail 2>/dev/null; echo done"
+oc logs kata-check
+oc delete pod kata-check
+```
 
 ### hostPath Volume Passthrough
 
-The supervisor binary is injected via a hostPath volume. Kata passes hostPath volumes into the VM via virtiofs or 9p. This works with standard Kata configurations. If your setup restricts host filesystem access, allow `/opt/openshell/bin` in the Kata `configuration.toml`.
+The supervisor binary is injected via a hostPath volume. Kata passes hostPath volumes into the VM via virtiofs. The sandboxed containers operator configures this by default. If you have customized Kata's `configuration.toml`, ensure `/opt/openshell/bin` is allowed.
 
-### Container Capabilities
+### Container Capabilities in Kata VMs
 
-The OpenShell K8s driver automatically requests `SYS_ADMIN`, `NET_ADMIN`, `SYS_PTRACE`, and `SYSLOG`. Inside a Kata VM these capabilities are scoped to the guest kernel, not the host.
+The OpenShell K8s driver automatically requests `SYS_ADMIN`, `NET_ADMIN`, `SYS_PTRACE`, and `SYSLOG`. Inside a Kata VM these capabilities are scoped to the guest kernel, not the host. The SCC grants them at the OpenShift admission layer.
 
 ### Performance
 
@@ -388,11 +629,16 @@ Kata adds 2-5 seconds of VM boot time. Runtime overhead is minimal for IO-bound 
 ```shell
 openshell sandbox delete my-claude
 openshell provider delete claude
-kubectl delete -f examples/kata-containers/supervisor-daemonset.yaml
+oc delete -f examples/kata-containers/supervisor-daemonset.yaml
 helm uninstall openshell -n openshell
-kubectl delete -f https://raw.githubusercontent.com/NVIDIA/OpenShell/main/deploy/kube/manifests/agent-sandbox.yaml
-kubectl delete namespace openshell
+oc delete -f https://raw.githubusercontent.com/NVIDIA/OpenShell/main/deploy/kube/manifests/agent-sandbox.yaml
+oc adm policy remove-scc-from-user openshell-sandbox -z default -n openshell
+oc delete scc openshell-sandbox openshell-supervisor-installer
+oc delete namespace openshell
+oc delete kataconfig cluster-kataconfig
 ```
+
+Removing the KataConfig triggers a MachineConfig rollout that removes Kata binaries and reboots each node.
 
 ## Next Steps
 
