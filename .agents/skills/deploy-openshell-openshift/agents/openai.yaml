@@ -1,0 +1,4 @@
+interface:
+  display_name: "Deploy OpenShell on OpenShift"
+  short_description: "Deploy and debug OpenShell on OpenShift"
+  default_prompt: "Use $deploy-openshell-openshift to deploy OpenShell on an OpenShift cluster and verify sandbox creation."

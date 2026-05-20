@@ -1,0 +1,196 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "OpenShift PRD Gap Appendix"
+sidebar-title: "OpenShift PRD Gaps"
+description: "Current-state appendix for the OpenShell on OpenShift PRD, mapping requirements to implemented behavior, workarounds, open issues, and open PRs."
+keywords: "Generative AI, Cybersecurity, Kubernetes, OpenShift, PRD, Roadmap, Gaps, Requirements"
+position: 7
+---
+
+This appendix maps the OpenShell on OpenShift PRD to the current upstream state reviewed on May 19, 2026 and re-validated end-to-end on a real OpenShift 4.22 cluster (3-node compact, RHCOS kernel 5.14, CRI-O 1.35) on May 20, 2026. It covers repository docs, public NVIDIA docs, public GitHub issues, public PRs, roadmap-labeled issues, the visible GitHub Projects page, and the install-time gaps captured during the live walkthrough.
+
+The bulletproof install guide that distills the live walkthrough is at [Deploy OpenShell on OpenShift](./openshift-deployment-guide). This appendix preserves the requirement-by-requirement gap accounting.
+
+## Reviewed Sources
+
+| Source | What was reviewed |
+|---|---|
+| `README.md` and docs under `docs/` | Current published-doc source, including Kubernetes, OpenShift, auth, security, observability, and support matrix pages. |
+| `deploy/helm/openshell` | Helm chart values, templates, README, and chart unit tests. |
+| `crates/openshell-driver-kubernetes` | Sandbox pod generation, runtimeClassName mapping, supervisor side-loading, workspace PVC behavior, event watch behavior, and GPU resource handling. |
+| `crates/openshell-server` and `proto/` | Public API fields, authz model, sandbox adoption behavior, provider model, and gateway configuration mapping. |
+| Public GitHub Issues | 117 open issues were visible from the repo page; OpenShift-relevant items and roadmap issues are summarized below. |
+| Public GitHub PRs | 47 open PRs were visible from the repo page; OpenShift-relevant PRs are summarized below. |
+| GitHub Projects | One open project, `OpenShell Roadmap` #233, is visible publicly, but detailed project contents were not visible without interactive GitHub project access. |
+
+## Executive Summary
+
+OpenShell has crossed the first Kubernetes enablement threshold: it has a published Helm chart, an in-cluster Kubernetes driver, Agent Sandbox integration, supervisor OCI side-loading, basic network policy for sandbox SSH ingress, Kubernetes resource sizing, gateway mTLS support, OIDC role/scope checks, and OCSF sandbox logs.
+
+OpenShift readiness is not complete. The documented OpenShift path is explicitly evaluation-only: install with TLS disabled, PKI job disabled, fixed UID/fsGroup cleared, and the namespace default service account bound to `privileged`. Kata can be tested through the public API, but the CLI lacks a runtime-class flag. Air-gapped deployment is possible only with careful manual image/chart mirroring and pull-secret workarounds. Multi-team operations should use one gateway per team namespace. Shared-gateway multi-tenancy is not ready because users, sandboxes, and providers are not scoped by owner.
+
+The May 20, 2026 live walkthrough on OpenShift 4.22.0-ec.5 surfaced four additional gaps that the prior doc revision did not account for. The bulletproof install guide is updated; the new gaps are tracked individually below so they show up as work items rather than being silently fixed in the runbook.
+
+| New gap | Surface | Verified workaround |
+|---|---|---|
+| Sandbox supervisor DNS resolver crashes on auto-derived gateway FQDN under OpenShift's `ndots:5` + four search-domain resolv.conf shape. | Supervisor binary on OpenShift. | Set `server.grpcEndpoint` to the trailing-dot FQDN, e.g. `http://openshell.openshell.svc.cluster.local.:8080`. |
+| Documented `securityContext.runAsNonRoot=true` + `runAsUser=null` is incompatible with the `USER nvs` (non-numeric) gateway image and kubelet refuses the pod. | Helm chart values + docs. | Unset `runAsNonRoot` in OpenShift values (`runAsNonRoot: null`) and let the SCC assign UID. |
+| Pod Security Admission `enforce: privileged` is required at the namespace label level; the SCC binding alone is not enough on OpenShift 4.22 because the cluster default PSA is `restricted`. | Namespace bootstrap. | Label namespace `pod-security.kubernetes.io/enforce=privileged`. |
+| The OpenShift path silently depends on a healthy cluster default StorageClass that supports RWO 1Gi/2Gi PVCs without `storageClassName`. ODF/Ceph backends in HEALTH_WARN block the entire install. | Gateway + per-sandbox PVCs. | Deploy a dynamic local provisioner (Rancher local-path-provisioner) with the SCC + SELinux fixes, then mark it default. |
+
+## Roadmap Snapshot
+
+The roadmap label currently includes several issues that affect or intersect OpenShift readiness:
+
+| Issue | Area | OpenShift relevance |
+|---|---|---|
+| #1012 High-availability Kubernetes Support | Kubernetes enterprise readiness | Defines M1-M3 Kubernetes milestones including Helm, existing-cluster deployment, runtime classes, OpenShift coverage, HA, observability, and operator direction. |
+| #1047 Runtime Reliability | Runtime hardening | Relevant to sandbox lifecycle, reconnect, and production operation. |
+| #1049 Sandbox to Sandbox Communications | Isolation and networking | Relevant to multi-agent flows and namespace/network boundaries. |
+| #1051 OpenShell Drivers | Driver roadmap | Includes Kubernetes, VM, Docker, Podman direction. |
+| #1054 OpenShell Telemetry | Telemetry | Relevant to enterprise observability. |
+| #1055 Enterprise Observability | Observability | Relevant to Prometheus, traces, dashboards, SIEM integration. |
+| #1361 CI/CD Improvements | Release validation | Relevant to reliable OpenShift/Kubernetes release canaries. |
+| #1444 GPU-accellerated Sandbox Support | GPU sandboxes | Relevant to OpenShift GPU clusters and Kata/GPU compatibility. |
+| #896 Enhanced Provider Management | Providers | Relevant to credential isolation and provider scoping. |
+| #873 Single-Tenant Local Workstation Sandboxes | Local mode | Less directly OpenShift-related but clarifies current single-player stance. |
+
+## OpenShift Relevant Issues
+
+| Issue | State | Why it matters |
+|---|---|---|
+| #899 Support restricted SecurityContextConstraints | Open | Tracks reducing or avoiding privileged SCC by introducing a platform/network mode. This is the central OpenShift security blocker. |
+| #996 Minimal changes to run OpenShell in an existing Kubernetes cluster | Open | Tracks removing prior hostPath assumptions, RBAC audit, and existing-cluster docs. Current main has supervisor OCI side-loading, but the issue remains a useful historical scope anchor. |
+| #1012 High-availability Kubernetes Support | Open, roadmap | Enterprise Kubernetes roadmap, including OpenShift coverage, runtime class configs, HA gateway, observability, operator, and test infrastructure. |
+| #1015 Private registry support | Open | Gateway image pull secrets exist; sandbox pod pull secrets are still a gap for private and air-gapped registries. |
+| #1018 Kubernetes RBAC docs | Open | Docs gap for minimum gateway RBAC; PR #1250 addresses it but is open. |
+| #1020 Agent Sandbox subchart | Open | Agent Sandbox must be installed separately today. |
+| #1024 cert-manager mTLS | Open | Chart has cert-manager resources, but issue remains open and OpenShift docs still do not use TLS. |
+| #1026 K8s E2E workflows | Open | K8s/OpenShift release validation is incomplete. |
+| #1030 sandbox imagePullSecrets | Open | Required for private registry and air-gapped sandbox images. |
+| #1145 Multi-tenant support roadmap | Open | Public ask for shared-gateway multi-tenant roadmap; directly maps to PRD M3. |
+| #848 custom sandbox entrypoint command | Open | Blocks daemon-agent UX and declarative long-running startup. PR #1326 partially addresses template env override. |
+| #1354 per-sandbox secret binding | Open | Security gap for sandbox-to-gateway RPC identity; PR #1404 addresses it. |
+
+## OpenShift Relevant PRs
+
+These PRs were open at review time. They are not assumed to be present in the current checkout until merged.
+
+| PR | State | Impact if merged |
+|---|---|---|
+| #1250 Kubernetes RBAC reference page | Open | Closes #1018 and gives operators the RBAC permission table needed for cluster review. |
+| #1270 Gateway OTLP traces and Kube monitoring | Open | Adds ServiceMonitor, OTLP tracing, and initial Kube monitoring docs. |
+| #1326 Respect template `OPENSHELL_SANDBOX_COMMAND` | Open | Lets template env override the hardcoded `sleep infinity`, but does not add a public `--command` CLI flag by itself. |
+| #1336 Kind-based Helm chart smoke test | Open | Adds a release canary for published Helm chart install and `openshell status`. |
+| #1363 Secret-backed DB URL for Postgres | Draft/Open | Enables Postgres without putting DB passwords in Helm values or release history. |
+| #1390 Use cgroup pids controller on K8s | Open | Avoids per-UID `RLIMIT_NPROC` problems on dense Kubernetes nodes. |
+| #1404 Per-sandbox authentication to gateway | Open | Addresses sandbox-to-gateway cross-sandbox identity gap. Important for M2/M3 isolation. |
+| #1414 SPIFFE supervisor authentication | Draft/Open | Adds optional SPIFFE/SPIRE supervisor identity. Useful for enterprise clusters but stacked on #1404. |
+| #1436 Configurable workspace PVC size | Open | Lets operators tune the default `/sandbox` PVC size. |
+| #1156 GPU request spec | Open | Relevant to GPU sandbox scheduling and HAMi/vGPU follow-ups. |
+
+## M1 OpenShift Readiness
+
+| Requirement | Current status | Evidence | Workaround today | Gap |
+|---|---|---|---|---|
+| Helm chart ships SCCs | Not implemented | No SCC templates or `openshift.enabled` value exist in `deploy/helm/openshell`. Current OpenShift docs use `oc adm policy add-scc-to-user privileged`. | Pre-create namespace and bind `privileged` SCC to `default` service account. | Add chart-rendered SCCs or documented cluster-admin install bundle. |
+| Pod Security Admission ready by default | Not implemented | `oc new-project` leaves namespace at the cluster-default PSA (`restricted` on OpenShift 4.x). The SCC binding alone does not relax PSA in time, so sandbox pods are rejected at admission with `violates PodSecurity ... capabilities.add ...`. | Explicitly label namespace `pod-security.kubernetes.io/enforce=privileged` before installing. | Chart should fail-fast or doc/skill should require the PSA label. The OpenShift `MinimallySufficientPodSecurityStandard` annotation should be respected by every Helm-rendered SA/role binding. |
+| Gateway image declares non-numeric `USER` | Empirical install bug | Chart sets `securityContext.runAsNonRoot: true` and the OpenShift docs additionally set `runAsUser: null`. The gateway image's Dockerfile declares `USER nvs`. Kubelet refuses the pod: `container has runAsNonRoot and image has non-numeric user (nvs), cannot verify user is non-root`. | Set `securityContext.runAsNonRoot: null` in OpenShift values; SCC handles non-root. | Either (a) numericize `USER` in the gateway Dockerfile, or (b) document `runAsNonRoot: null` as the canonical OpenShift override. |
+| Sandbox supervisor DNS on OpenShift resolv.conf | Empirical install bug | With OpenShift's default `ndots:5` plus four search domains, the supervisor's hyper-util DNS resolver returns `failed to connect to OpenShell server` in <5 ms when the auto-derived gateway FQDN `openshell.openshell.svc.cluster.local` is used. `curl --http2-prior-knowledge` from the same pod succeeds. Trailing-dot FQDN or cluster IP both work. | Pin `server.grpcEndpoint` to the trailing-dot FQDN (`http://openshell.openshell.svc.cluster.local.:8080`). | Either (a) fix the resolver to behave correctly with `ndots:5` + search domains, (b) have the chart helper emit the trailing-dot form by default when the cluster is OpenShift, or (c) document it as a required override. |
+| Gateway PVC has configurable storage class/size | Not implemented | `deploy/helm/openshell/templates/statefulset.yaml` hardcodes `volumeClaimTemplates` with `accessModes: ["ReadWriteOnce"]`, `storage: 1Gi`, no `storageClassName`. Falls back to cluster default; unhealthy default storage silently breaks install. | Make a healthy SC the cluster default before install. | Add `gateway.persistence.storageClass`, `gateway.persistence.size`, `gateway.persistence.accessModes`. |
+| Sandbox PVCs have configurable storage class/size | Not implemented | `crates/openshell-driver-kubernetes/src/driver.rs` hardcodes `volumeClaimTemplates` with `accessModes: ["ReadWriteOnce"]`, `storage: "2Gi"`, no `storageClassName`. Same fall-back behavior as the gateway PVC. | Make a healthy SC the cluster default before install. | Add Helm or template-level overrides for sandbox PVC class/size. |
+| SELinux binary relabeling | PRD item is outdated for current main | Current Kubernetes driver side-loads supervisor through OCI image plus `emptyDir` or ImageVolume. No hostPath binary copy/chcon path is present. | Force `supervisor.sideloadMethod=init-container` on OpenShift. | Still need SELinux/SCC documentation for root/capabilities and Kata scoping. |
+| cert-manager integration | Partially implemented | `certManager.enabled`, Issuer, Certificate templates, and values exist. | For official OpenShift evaluation, disable TLS. For experiments, install cert-manager and manually extract `openshell-client-tls`. | OpenShift docs do not yet validate cert-manager mTLS as a supported path. |
+| `--runtime-class` CLI flag | Not implemented | Public proto has `SandboxTemplate.runtime_class_name`; CLI create args do not include runtime class. | Use Python SDK or lower-level gRPC request with `runtime_class_name="kata"`. | Add CLI flag and docs. |
+| Helm image overrides | Mostly implemented | `image.repository/tag`, `supervisor.image.repository/tag`, and `server.sandboxImage` exist. | Use values file to point at internal registry. | Sandbox image pull secrets are missing as first-class config. |
+| Air-gapped mirroring docs | Not implemented for OpenShift | No OpenShift-specific air-gap doc. RPM docs mention air-gap concepts; chart docs list values. | Manually mirror gateway, supervisor, base sandbox, Agent Sandbox, cert-manager, local-path-provisioner, busybox helper, and operator images with `skopeo copy --all`. | Add official mirror matrix and disconnected OpenShift instructions, including the dynamic local-storage provisioner choice. |
+| OpenShift + Kata tutorial | Not implemented | Existing OpenShift doc does not mention Kata. | Install sandboxed containers operator, verify `RuntimeClass`, create sandbox through Python SDK. | Add first-class tutorial and CLI support. |
+| `--command` flag | Not implemented | CLI supports trailing post-create command, not declarative daemon startup. Driver overwrites `OPENSHELL_SANDBOX_COMMAND` on main. | Post-create `openshell sandbox exec`, or track PR #1326 for template env override. | Add public `SandboxSpec.command` and CLI `--command` if daemon UX is required. |
+| Interactive `sandbox create` over port-forward | Behavior gap | Foreground `openshell sandbox create` opens an SSH-over-gRPC TTY through `oc port-forward` and hangs on TTY allocation. Non-TTY `sandbox exec` works. | Use `echo "" \| openshell sandbox exec ...` for verification; expose a Route/Ingress for production interactive use. | Either fix TTY handling over kubectl port-forward, or document Route as a prerequisite for interactive `sandbox create`/`sandbox connect`. |
+| GitOps sandbox template | Not supported | Driver watches CRs but external adoption stores `spec: None`; docs do not define a supported manifest. | Use CLI/API-created sandboxes. | Define driver-generated CR schema and gateway adoption semantics. |
+| Gateway adopts external CRs | Partial and insufficient | Watch path can create gateway records for existing CRs with a sandbox ID, but does not reconstruct policy/providers/spec. | Avoid external CR creation except for debugging. | Implement full adoption, policy sync, provider injection, and SSH/session binding. |
+
+## M2 Multi-Team Operations
+
+| Requirement | Current status | Evidence | Workaround today | Gap |
+|---|---|---|---|---|
+| Gateway-per-team guide | Not shipped | No dedicated docs for one release per namespace. | Install one Helm release per team namespace with separate gateway name and providers. | Add onboarding guide and release naming conventions. |
+| Default-deny NetworkPolicy | Partially implemented | Chart creates ingress NetworkPolicy that allows only gateway-to-sandbox SSH port 2222 for sandbox pods. It does not restrict egress. | Keep chart `networkPolicy.enabled=true`; rely on OpenShell proxy policy for egress decisions. | Add explicit docs and optional egress NetworkPolicy/profile decisions. |
+| `gateway setup-certs` | Not implemented | CLI has no cluster cert extraction command. Docs show manual secret extraction for Kubernetes mTLS. | Use `oc get secret ... | base64 -d` into `~/.config/openshell/gateways/<name>/mtls`. | Add CLI command that reads cluster secrets and writes gateway credential layout. |
+| Namespace onboarding template | Not implemented | No script or chart mode creates namespace + SCC + certs + release. | Use shell commands in the deployment guide. | Add script, Helmfile, ArgoCD ApplicationSet, or operator flow. |
+| Credential isolation per sandbox | Partial, changing | Providers are gateway-level records. PR #1404 addresses sandbox supervisor identity, not user-owned provider scoping. | Use one gateway per team and separate providers per gateway. | Add user/team provider ownership and sandbox-scoped provider access. |
+| Per-sandbox instance isolation | Mostly implemented | Each sandbox maps to its own Agent Sandbox CR/pod/PVC and supervisor. | Use one sandbox per session and delete when done. | Stronger user ownership and lifecycle policies still needed. |
+
+## M3 Shared Gateway Multi-Team
+
+| Requirement | Current status | Evidence | Workaround today | Gap |
+|---|---|---|---|---|
+| Owner field on Sandbox | Not implemented | `ObjectMeta` has id, name, labels, timestamps, resource version; no owner. | Use labels such as `team=<team>` for filtering, not security. | Add owner/created_by and persist authenticated identity. |
+| Identity extraction | Partially implemented for authz | OIDC identity, roles, and scopes exist; mTLS identity type exists. | Use OIDC for method-level auth. | Bind identity to object ownership and API filtering. |
+| Provider scoping | Not implemented | Provider model has metadata/type/credentials/config, no owner/team scope. Admin methods gate provider writes; read lists are not team scoped. | Separate gateway per team. | Add provider ownership, team scopes, and policy checks. |
+| Scoped operations | Not implemented | Authz is method/role/scope based. It does not enforce "this user owns this sandbox". | Separate gateway per team. | Enforce ownership on list, get, delete, connect, exec, policy, provider attachment, and service operations. |
+| Shared gateway serves 50+ users | Not ready | HA roadmap open; SQLite default; multi-replica and Postgres work are in progress. | Do not use shared gateway for production multi-user isolation. | HA gateway, Postgres validation, object ownership, and operational SLOs. |
+
+## M4 Advanced Isolation
+
+| Requirement | Current status | Evidence | Workaround today | Gap |
+|---|---|---|---|---|
+| Custom SELinux module | Not implemented | No SELinux module or SCC chart is present. | Use Kata to scope privileged behavior inside guest VM, but still bind `privileged` SCC. | Design and ship restricted SCC/platform mode or custom SELinux policy. |
+| Landlock on RHCOS 5.19+ | Partial | OpenShell supports Landlock best-effort/hard-requirement. Docs recommend kernel 5.13+, but newer ABI features depend on kernel version. | Use `best_effort` for OpenShift testing and inspect OCSF findings. | Document exact RHCOS kernel/ABI behavior and supported policy modes. |
+| OCSF audit events for OpenShift | Partial | Sandbox OCSF shorthand and JSONL export exist inside sandboxes. Gateway OTLP/Kube monitoring is in PR #1270. | Stream `openshell logs` and enable `ocsf_json_enabled`; ship sandbox log files externally. | Add OpenShift-native log shipping, ServiceMonitor/OTLP, dashboards, and SIEM examples. |
+| Hardware-level isolation via Kata | Possible but not first-class | Runtime class API maps through; CLI missing flag and docs missing tutorial. | Python SDK runtime class workaround. | Add CLI, docs, and compatibility testing. |
+
+## Non-Functional Gaps
+
+| Area | PRD target | Current state | Gap |
+|---|---|---|---|
+| Deployment time to first sandbox | Not specified in PRD | No OpenShift benchmark exists. | Add repeatable timing test for gateway install, first sandbox pull, warm sandbox create, and Kata start. |
+| Manual post-install steps | Zero | Current path requires namespace creation, SCC binding, Agent Sandbox install, optional cert extraction, and port-forward. | Chart/operator/onboarding automation needed. |
+| Sandbox startup with Kata | Not specified in PRD | No benchmark in docs. | Add test matrix by runtime class and image pull state. |
+| Sandbox startup with runc | Not specified in PRD | No OpenShift benchmark in docs. | Add baseline test. |
+| Teams per cluster | 10+ | Gateway-per-team is plausible but not documented or tested as such. | Add namespace onboarding, quotas, naming, and smoke tests. |
+| Users per shared gateway | 50+ | Not ready. | Requires M3 ownership and HA work. |
+| OpenShift compatibility | 4.22+ | Existing doc says OpenShift 4.x; no 4.22-specific validation matrix. | Add version matrix and CI/e2e coverage. |
+| RHCOS kernel compatibility | Not filled in PRD | Docs describe Landlock generally, not RHCOS ABI. | Add RHCOS kernel table and policy recommendations. |
+| SELinux enforcing | Required | Current path uses SCC exception, not custom SELinux confinement. | Document exact SELinux labels and long-term replacement. |
+| StorageClass | Not filled in PRD | PVCs require a default or specified StorageClass. Chart does not expose gateway PVC size/storageClass in current values. | Add storage values and docs. |
+| Database | M2 | SQLite default in gateway PVC. PR #1363 adds Secret-backed Postgres URL. | Merge and validate Postgres, migrations, backups, HA. |
+| Node failure | M2 | Gateway StatefulSet is one replica and sandbox behavior under node loss is not documented. | HA, reconnect, and rescheduling tests. |
+
+## Current Workarounds
+
+| Need | Workaround |
+|---|---|
+| Run on OpenShift today | Use plaintext MVP install with `pkiInitJob.enabled=false`, `server.disableTls=true`, `securityContext.runAsNonRoot=null`, cleared UID/fsGroup, manual `privileged` SCC binding, `pod-security.kubernetes.io/enforce=privileged` namespace label, healthy default StorageClass, and `server.grpcEndpoint="http://openshell.openshell.svc.cluster.local.:8080"`. |
+| Default StorageClass is broken or unsuitable | Deploy `rancher/local-path-provisioner` (v0.0.31 or newer), grant `privileged` SCC to its SAs, `mkdir -p /opt/local-path-provisioner && chmod 1777 && chcon -Rt container_file_t` on every node, mark it default. Without the SELinux `chcon` step the helper pod cannot `mkdir` and PVCs stay `Pending`. |
+| Reused hostPath/local data dir | Wipe `/var/openshell-data` (or your custom path) before reinstall, or the gateway dies on the first start with `migration N was previously applied but is missing in the resolved migrations`. |
+| Test Kata | Install OpenShift sandboxed containers, verify `RuntimeClass`, create sandbox with Python SDK `SandboxTemplate.runtime_class_name`. |
+| Air-gapped image pulls | Mirror gateway, supervisor, sandbox, Agent Sandbox, cert-manager, local-path-provisioner, busybox helper, and operator images with `skopeo copy --all`; override Helm values; attach pull secret to gateway service account and namespace `default` service account. |
+| mTLS CLI access | Use cert-manager experiment or built-in PKI on non-OpenShift; manually extract `openshell-client-tls` into CLI gateway `mtls/`. |
+| Team isolation | Use one namespace and one Helm release per team. Re-apply the PSA label and SCC binding per namespace, and override `server.grpcEndpoint` per release to match the per-namespace service FQDN. |
+| Daemon agents | Run post-ready `openshell sandbox exec` (stdin-piped, non-TTY) or track PR #1326; true declarative daemon startup remains a gap. |
+| Declarative/GitOps | Manage Helm release declaratively; do not manage sandbox CRs declaratively for production yet. |
+
+## Documentation Gaps to Update
+
+| Document | Needed update |
+|---|---|
+| `docs/kubernetes/openshift.mdx` | Replace the minimal install-only page with a decision tree that links to plaintext MVP, cert-manager experiment, Kata workaround, air-gap, and troubleshooting. |
+| `docs/kubernetes/setup.mdx` | Add OpenShift notes where values differ, especially `supervisor.sideloadMethod`, SCC, and sandbox image pull secret caveats. |
+| `docs/kubernetes/managing-certificates.mdx` | Add OpenShift-specific warning and manual extraction steps until `gateway setup-certs` exists. |
+| `docs/kubernetes/access-control.mdx` | Fix or document `server.disableGatewayAuth`: template supports it, generated values docs do not list it. Clarify that OIDC roles/scopes are not object ownership. |
+| `docs/reference/support-matrix.mdx` | Add OpenShift/RHCOS/Kata/Landlock matrix, supervisor image, and sandbox image override details. |
+| `deploy/helm/openshell/README.md` | Add current OpenShift caveats, private sandbox image pull secret workaround, and cert-manager experimental notes. |
+| New RBAC page | Merge or recreate PR #1250 content so operators can review permissions without reading templates. |
+| New air-gap page | Document all images, chart mirroring, Agent Sandbox, cert-manager, sandboxed containers operator, multi-arch `--all`, and pull secret wiring. |
+| New multi-team page | Document gateway-per-team model, namespace onboarding, release naming, quota/network policy choices, and non-goals for shared gateway. |
+
+## Release and PRD Notes
+
+- The README still states alpha "single-player mode", which is consistent with the M3 gaps.
+- The latest stable release observed during review was `v0.0.43`, published May 18, 2026. The OCI Helm chart followed with `0.0.44` on May 19, 2026. Pin chart/image/CLI versions to the same release rather than using floating `dev` or `latest`; mixing chart `0.0.44` with CLI `0.0.43` is not validated.
+- The CLI install script enforces a `BREAKING_RELEASE_VERSION` threshold (currently `0.0.37`) that requires `OPENSHELL_ACK_BREAKING_UPGRADE=1` when crossing. This is fine for fresh installs but is a friction point when upgrading older workstations.
+- The visible public GitHub project `OpenShell Roadmap` exists as project #233 and was updated May 19, 2026, but detailed cards were not accessible through the public web page in this review. Roadmap-labeled issues are therefore the actionable public roadmap source used here.
+- Several requirements in the PRD have already drifted from the implementation. The most important drift: the PRD assumes a supervisor DaemonSet/hostPath/chcon flow, while current main uses supervisor OCI image side-loading. Keep the PRD focused on the required outcome rather than the old mechanism.
+- The May 20, 2026 live walkthrough added four empirically-discovered gaps (supervisor DNS resolver, `runAsNonRoot`/`USER nvs` conflict, namespace PSA enforce label, hardcoded PVC class/size). These should be merged into the next PRD revision as M1 acceptance criteria rather than left to the install guide.

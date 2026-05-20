@@ -9,10 +9,12 @@ position: 5
 ---
 
 <Warning>
-The OpenShift install path is experimental. It currently requires running sandbox pods under the `privileged` SCC and installing the gateway with TLS and the PKI init job disabled. Use only for evaluation on a private network.
+The OpenShift install path is experimental. It currently requires running sandbox pods under the `privileged` SCC, labeling the namespace `pod-security.kubernetes.io/enforce=privileged`, installing the gateway with TLS and the PKI init job disabled, and overriding the supervisor gateway endpoint with a trailing-dot FQDN to avoid an OpenShift DNS resolver issue. Use only for evaluation on a private network.
 </Warning>
 
-OpenShift's [Security Context Constraints](https://docs.openshift.com/container-platform/latest/authentication/managing-security-context-constraints.html) reject the chart's default pod security settings. Installing on OpenShift requires precreating the namespace, granting the `privileged` SCC to the default service account, and overriding a few chart values so the cluster admission controller can assign UIDs and FS groups itself.
+For the full bulletproof deployment runbook (verified end-to-end on OpenShift 4.22 with chart `0.0.43`), the Kata workaround, air-gapped notes, storage workarounds, and PRD gap ledger, refer to [Deploy OpenShell on OpenShift](/kubernetes/openshift-deployment-guide) and [OpenShift PRD Gap Appendix](/kubernetes/openshift-prd-gap-appendix).
+
+OpenShift's [Security Context Constraints](https://docs.openshift.com/container-platform/latest/authentication/managing-security-context-constraints.html) and [Pod Security Admission](https://kubernetes.io/docs/concepts/security/pod-security-admission/) reject the chart's default pod security settings. Installing on OpenShift requires precreating the namespace, labeling it for PSA `privileged`, granting the `privileged` SCC to the default service account, overriding a few chart values so the cluster admission controller can assign UIDs and FS groups itself, and pinning the supervisor gateway endpoint to a trailing-dot FQDN so the supervisor's DNS resolver does not crash on the OpenShift `ndots:5` resolv.conf shape.
 
 ## Prerequisites
 
@@ -24,32 +26,62 @@ OpenShift's [Security Context Constraints](https://docs.openshift.com/container-
 
 <Steps>
 
-## Create the namespace
+## Create the namespace, label PSA, and grant SCC
 
-Pre-create the namespace so the SCC binding can be applied before the chart installs:
-
-```shell
-oc create ns openshell
-```
-
-## Grant the privileged SCC to sandbox pods
-
-Sandbox pods run under the `default` service account in the `openshell` namespace and require the `privileged` SCC:
+Pre-create the namespace, label it for Pod Security Admission, and bind the `privileged` SCC to its default service account. All three are required: SCC binding alone is not enough on OpenShift 4.x because the default cluster-level PSA enforce mode is `restricted`.
 
 ```shell
+oc new-project openshell || oc project openshell
+
+oc label ns openshell \
+  pod-security.kubernetes.io/enforce=privileged \
+  pod-security.kubernetes.io/enforce-version=latest \
+  pod-security.kubernetes.io/warn=privileged \
+  pod-security.kubernetes.io/audit=privileged \
+  --overwrite
+
 oc adm policy add-scc-to-user privileged -z default -n openshell
 ```
 
 ## Install the chart with OpenShift overrides
 
+Save these values to `openshift-values.yaml` (the `--set` form is unwieldy because of the trailing-dot endpoint and the `runAsNonRoot: null` requirement):
+
+```yaml
+supervisor:
+  sideloadMethod: init-container
+
+server:
+  disableTls: true
+  sandboxNamespace: openshell
+  grpcEndpoint: "http://openshell.openshell.svc.cluster.local.:8080"
+
+pkiInitJob:
+  enabled: false
+
+certManager:
+  enabled: false
+
+podSecurityContext:
+  fsGroup: null
+
+securityContext:
+  runAsNonRoot: null
+  runAsUser: null
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+
+networkPolicy:
+  enabled: true
+```
+
 ```shell
 helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
   --version <version> \
   --namespace openshell \
-  --set pkiInitJob.enabled=false \
-  --set server.disableTls=true \
-  --set podSecurityContext.fsGroup=null \
-  --set securityContext.runAsUser=null
+  --values openshift-values.yaml
 ```
 
 | Override | Reason |
@@ -57,6 +89,9 @@ helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
 | `pkiInitJob.enabled=false` | The PKI init Job runs as a non-root user with a fixed UID, which the SCC admission rewrites or rejects. Disabling it skips the Job; TLS must also be disabled. |
 | `server.disableTls=true` | The gateway has no certificates without `pkiInitJob`, so it must run plaintext. |
 | `podSecurityContext.fsGroup=null` / `securityContext.runAsUser=null` | Clear the chart's hardcoded UID and fsGroup so OpenShift's SCC admission can assign them. |
+| `securityContext.runAsNonRoot=null` | The gateway image declares `USER nvs` (non-numeric). With `runAsNonRoot: true` and no numeric `runAsUser`, kubelet refuses the pod (`container has runAsNonRoot and image has non-numeric user (nvs)`). Setting `runAsNonRoot: null` lets the SCC-assigned UID govern non-root behavior. |
+| `supervisor.sideloadMethod=init-container` | `image-volume` requires the K8s ImageVolume feature; init-container is safe on all supported OpenShift versions. |
+| `server.grpcEndpoint="http://openshell.openshell.svc.cluster.local.:8080"` (trailing dot) | The chart auto-derives the FQDN without a trailing dot. OpenShift's resolv.conf uses `ndots:5` with four search domains; the sandbox supervisor's DNS resolver crashes on that combination. The trailing dot bypasses search-domain expansion. Without this override the install succeeds but every sandbox crash-loops with `Policy fetch failed after 5 attempts: failed to connect to OpenShell server`. |
 
 ## Wait for the gateway to be ready
 
@@ -83,6 +118,8 @@ openshell status
 
 ## Next Steps
 
+- For the complete OpenShift deployment and troubleshooting runbook, refer to [Deploy OpenShell on OpenShift](/kubernetes/openshift-deployment-guide).
+- For requirement tracking against the OpenShift PRD, refer to [OpenShift PRD Gap Appendix](/kubernetes/openshift-prd-gap-appendix).
 - For TLS-enabled deployments, refer to [Managing Certificates](/kubernetes/managing-certificates) after SCC-compatible PKI is supported.
 - To expose the gateway externally, refer to [Ingress](/kubernetes/ingress).
 - To configure OIDC authentication, refer to [Access Control](/kubernetes/access-control).

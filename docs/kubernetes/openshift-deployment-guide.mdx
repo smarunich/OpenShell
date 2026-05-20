@@ -1,0 +1,617 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Deploy OpenShell on OpenShift"
+sidebar-title: "OpenShift Deployment Guide"
+description: "Bulletproof OpenShell deployment guide for OpenShift 4.x, including the values, SCC, PSA, storage, supervisor DNS, and CLI workarounds verified end-to-end on OpenShift 4.22 with chart 0.0.43."
+keywords: "Generative AI, Cybersecurity, Kubernetes, OpenShift, Helm, SCC, Pod Security Admission, Kata Containers, cert-manager, Air-Gapped, Agent Sandbox"
+position: 6
+---
+
+<Warning>
+This guide is the end-to-end OpenShift install path validated on May 20, 2026 with OpenShell chart `0.0.43`, CLI `0.0.43`, OpenShift 4.22.0-ec.5, Kubernetes 1.35.3, RHCOS 9.8 (kernel 5.14.0-687.5.1), CRI-O 1.35.1, and Agent Sandbox controller-gen v0.19.0. The OpenShift path is still officially experimental. Follow this guide for evaluation installs only.
+</Warning>
+
+Use this guide when you need OpenShell on an OpenShift cluster and want every documented override that is actually required, not the minimum set. Each section calls out the requirement, the verified command, and the failure mode you avoid.
+
+For a requirement-by-requirement gap table, see [OpenShift PRD Gap Appendix](./openshift-prd-gap-appendix).
+
+## Bulletproof Order of Operations
+
+1. Match your CLI and chart version pin.
+2. Verify the cluster baseline (Agent Sandbox, cert-manager if needed, storage, runtime classes).
+3. Provide a working dynamic StorageClass that is the namespace default.
+4. Create the OpenShell namespace with the correct Pod Security Admission label and bind the `privileged` SCC.
+5. Install the chart with the verified values, including the supervisor DNS workaround.
+6. Start a `oc port-forward`, register the gateway, and run a sandbox smoke test using stdin-piped `sandbox exec`.
+
+Skip a step and the install will appear to succeed but sandboxes will crash-loop with an unhelpful error.
+
+## Cluster Compatibility Matrix
+
+This is the configuration verified by the lab install above. Other OpenShift 4.x clusters work but may require adjustments.
+
+| Item | Verified |
+|---|---|
+| OpenShift | 4.22.0-ec.5 |
+| Kubernetes | v1.35.3 |
+| RHCOS kernel | 5.14.0-687.5.1.el9_8.x86_64 |
+| CRI-O | 1.35.1 |
+| Agent Sandbox CRD/controller | v1alpha1, controller-gen v0.19.0 |
+| cert-manager | 1.x with trust-manager (optional path) |
+| OpenShift sandboxed containers | `RuntimeClass kata` available |
+| Landlock | ABI V2 BestEffort works at runtime |
+| OpenShell chart | `0.0.43` (pin explicitly) |
+| OpenShell CLI | `0.0.43` (must match the chart) |
+
+## Step 1 — Match CLI to Chart
+
+The published Helm chart can be ahead of the latest GitHub CLI release. Mixing chart `0.0.44` with CLI `0.0.43` is not supported; pin both to the same version.
+
+```shell
+# Latest stable CLI from the GitHub release.
+curl -fsSL https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh -o install.sh
+OPENSHELL_VERSION=v0.0.43 OPENSHELL_ACK_BREAKING_UPGRADE=1 sh install.sh
+which openshell
+openshell --version
+```
+
+<Warning>
+If you have an older OpenShell installed via `uv tool install` it shadows the Homebrew/Linux package install at `~/.local/bin/openshell`. Either remove the shadow or call the package binary by absolute path (`/opt/homebrew/bin/openshell` on macOS). `OPENSHELL_ACK_BREAKING_UPGRADE=1` is required when crossing the breaking-release threshold pinned in the install script (currently `0.0.37`).
+</Warning>
+
+You also need:
+
+| Tool | Why |
+|---|---|
+| `oc` | OpenShift admin (SCC, debug node, port-forward) |
+| `helm` 3.x | Chart install/upgrade |
+| `jq` | YAML/JSON drilling during validation |
+| `skopeo` | Only when mirroring images for air-gap |
+
+## Step 2 — Verify the Cluster Baseline
+
+OpenShell on OpenShift expects several cluster-level components to already exist. Verify them before touching the OpenShell chart.
+
+```shell
+export KUBECONFIG=/path/to/kubeconfig
+
+oc whoami
+oc get clusterversion
+oc get nodes -o wide
+```
+
+Check each baseline component:
+
+```shell
+# Agent Sandbox CRD + controller
+oc api-resources | grep 'agents.x-k8s.io'
+oc get deploy,statefulset -A | grep agent-sandbox
+
+# Optional: cert-manager (only if you plan to test mTLS)
+oc get crd | grep cert-manager.io
+
+# Optional: Kata RuntimeClass (only if you plan to test hardware-isolated sandboxes)
+oc get runtimeclass
+
+# StorageClasses available
+oc get sc
+```
+
+If `agents.x-k8s.io/v1alpha1 Sandbox` is missing, install Agent Sandbox first. The chart does not bundle it.
+
+```shell
+AGENT_SANDBOX_VERSION="$(
+  curl -s https://api.github.com/repos/kubernetes-sigs/agent-sandbox/releases/latest |
+    jq -r '.tag_name'
+)"
+
+oc apply -f "https://github.com/kubernetes-sigs/agent-sandbox/releases/download/${AGENT_SANDBOX_VERSION}/manifest.yaml"
+oc -n agent-sandbox-system rollout status deploy/agent-sandbox-controller --timeout=120s
+```
+
+## Step 3 — Provide a Working Dynamic StorageClass
+
+The OpenShell chart hard-codes the gateway `volumeClaimTemplates` with `accessModes: [ReadWriteOnce]`, `storage: 1Gi`, and **no `storageClassName`**. The Kubernetes driver creates each sandbox PVC the same way. Both fall back to the cluster default StorageClass. If the cluster default is unhealthy or unsupported (for example, an ODF Ceph cluster with crashing OSDs), every pod will sit in `Pending` with `failed to provision volume`.
+
+Pick one of the following:
+
+| Situation | Action |
+|---|---|
+| Cluster default is healthy block storage | Skip this step. |
+| Cluster default is broken or only RWX | Deploy a dynamic local-storage provisioner and make it the new default. |
+
+The verified pattern for a fast local-storage default on OpenShift is Rancher's `local-path-provisioner` plus two OpenShift-specific adjustments:
+
+```shell
+LPP_VERSION=v0.0.31
+
+oc apply -f "https://raw.githubusercontent.com/rancher/local-path-provisioner/${LPP_VERSION}/deploy/local-path-storage.yaml"
+
+# OpenShift SCC: helper pods need root + hostPath
+oc adm policy add-scc-to-user privileged \
+  -z local-path-provisioner-service-account -n local-path-storage
+oc adm policy add-scc-to-user privileged \
+  -z default -n local-path-storage
+
+# Pre-create the helper-pod directory with a container-friendly SELinux type on every node.
+for NODE in $(oc get nodes -o name | sed 's|node/||'); do
+  oc debug -q node/${NODE} \
+    --image=registry.redhat.io/ubi9/ubi-minimal:latest -- \
+    chroot /host bash -c '
+      mkdir -p /opt/local-path-provisioner
+      chmod 1777 /opt/local-path-provisioner
+      chcon -Rt container_file_t /opt/local-path-provisioner
+    '
+done
+
+# Swap the cluster default StorageClass.
+DEFAULT_SC=$(oc get sc -o jsonpath='{range .items[?(@.metadata.annotations.storageclass\.kubernetes\.io/is-default-class=="true")]}{.metadata.name}{"\n"}{end}')
+[ -n "${DEFAULT_SC}" ] && oc annotate sc "${DEFAULT_SC}" storageclass.kubernetes.io/is-default-class=false --overwrite
+oc annotate sc local-path storageclass.kubernetes.io/is-default-class=true --overwrite
+
+# Smoke-test the new default.
+cat <<'YAML' | oc apply -f -
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: storage-smoke
+  namespace: default
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 1Gi
+YAML
+oc -n default get pvc storage-smoke
+```
+
+The smoke PVC stays `Pending` (WaitForFirstConsumer) until a pod claims it; that is expected. Tear it down once you've confirmed the StorageClass is wired in.
+
+<Warning>
+On OpenShift, `mkdir -p` plus `chmod 1777` is not enough because SELinux denies the helper pod's writes. The `chcon -Rt container_file_t` step is required. Without it you'll see helper pods exit with `mkdir: can't create directory '/opt/local-path-provisioner/...': Permission denied` and PVCs stuck in `Pending`.
+</Warning>
+
+## Step 4 — Create the Namespace, Set PSA, and Bind the SCC
+
+The OpenShell namespace must satisfy three things simultaneously:
+
+1. Pod Security Admission `enforce: privileged` so sandbox pods with `SYS_ADMIN`, `NET_ADMIN`, `SYS_PTRACE`, and `SYSLOG` capabilities are admitted.
+2. The `privileged` SCC bound to the namespace `default` service account so OpenShift admission lets those capabilities through.
+3. UID and fsGroup ranges populated by OpenShift (the chart does not hard-code them once you apply the values in Step 5).
+
+```shell
+export OPENSHELL_NAMESPACE=openshell
+
+oc new-project "${OPENSHELL_NAMESPACE}" || oc project "${OPENSHELL_NAMESPACE}"
+
+oc label ns "${OPENSHELL_NAMESPACE}" \
+  pod-security.kubernetes.io/enforce=privileged \
+  pod-security.kubernetes.io/enforce-version=latest \
+  pod-security.kubernetes.io/warn=privileged \
+  pod-security.kubernetes.io/audit=privileged \
+  --overwrite
+
+oc adm policy add-scc-to-user privileged -z default -n "${OPENSHELL_NAMESPACE}"
+
+oc auth can-i use scc/privileged \
+  --as "system:serviceaccount:${OPENSHELL_NAMESPACE}:default" \
+  -n "${OPENSHELL_NAMESPACE}"
+```
+
+The expected output is `yes`. Also confirm the auto-generated PSA hint:
+
+```shell
+oc get ns "${OPENSHELL_NAMESPACE}" \
+  -o jsonpath='{.metadata.annotations.security\.openshift\.io/MinimallySufficientPodSecurityStandard}{"\n"}'
+```
+
+It should print `privileged`. If it prints `restricted` or `baseline`, re-check the SCC binding and the PSA labels.
+
+<Warning>
+`oc new-project` does **not** apply PSA labels by default. New OpenShift 4.x clusters enforce `pod-security.kubernetes.io/enforce=restricted` at the cluster level. Without the explicit `privileged` label on this namespace, sandbox pods will be denied at admission with `forbidden: violates PodSecurity ... allowPrivilegeEscalation != false; capabilities.add ...` even though the SCC binding is correct.
+</Warning>
+
+<Warning>
+The `privileged` SCC is a broad exception. It is required today because the sandbox supervisor runs as root and requests SYS_ADMIN, NET_ADMIN, SYS_PTRACE, and SYSLOG. Kata Containers can scope those privileges inside the guest VM, but OpenShift admission still has to accept the pod spec. Issue [#899](https://github.com/NVIDIA/OpenShell/issues/899) tracks a restricted SCC/platform mode.
+</Warning>
+
+If you're recycling a hostPath data directory from a previous install attempt, wipe it now or the gateway will crash on the first start with `migration N was previously applied but is missing in the resolved migrations`:
+
+```shell
+for NODE in $(oc get nodes -o name | sed 's|node/||'); do
+  oc debug -q node/${NODE} \
+    --image=registry.redhat.io/ubi9/ubi-minimal:latest -- \
+    chroot /host bash -c 'rm -rf /var/openshell-data/* /var/openshell-data/.[!.]* 2>/dev/null || true'
+done
+```
+
+## Step 5 — Install the Gateway with the Verified Values
+
+Save the following as `openshift-values.yaml`. Every field below is required for the install to succeed end-to-end.
+
+```yaml
+image:
+  repository: ghcr.io/nvidia/openshell/gateway
+  tag: "0.0.43"          # pin instead of inheriting appVersion
+
+supervisor:
+  image:
+    repository: ghcr.io/nvidia/openshell/supervisor
+    tag: "0.0.43"
+  sideloadMethod: init-container
+
+server:
+  disableTls: true
+  sandboxNamespace: openshell
+  sandboxImage: ghcr.io/nvidia/openshell-community/sandboxes/base:latest
+  logLevel: info
+  # REQUIRED: explicit trailing-dot FQDN bypasses the ndots:5 search-domain
+  # expansion that crashes the sandbox supervisor's DNS resolver on OpenShift.
+  grpcEndpoint: "http://openshell.openshell.svc.cluster.local.:8080"
+
+pkiInitJob:
+  enabled: false
+
+certManager:
+  enabled: false
+
+podSecurityContext:
+  fsGroup: null
+
+securityContext:
+  runAsNonRoot: null     # MUST be unset, see warning below
+  runAsUser: null
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+
+networkPolicy:
+  enabled: true
+```
+
+<Warning>
+Do not copy the old guidance that sets `securityContext.runAsNonRoot=true` and `runAsUser=null`. The gateway image declares `USER nvs` (non-numeric). With `runAsNonRoot=true` and no numeric `runAsUser`, kubelet refuses the pod with `Error: container has runAsNonRoot and image has non-numeric user (nvs), cannot verify user is non-root`. Set `runAsNonRoot: null` so the SCC-assigned UID is what governs non-root behavior. This affects every OpenShift install and was the single most common cause of "the chart installs but the gateway pod stays `CreateContainerConfigError`".
+</Warning>
+
+<Warning>
+Do not copy the old guidance that omits `server.grpcEndpoint`. The chart auto-derives `http://openshell.openshell.svc.cluster.local:8080` without a trailing dot. The sandbox supervisor's hyper-util DNS resolver crashes on the OpenShift `ndots:5` resolv.conf with four search domains, producing `failed to connect to OpenShell server` even though `curl --http2-prior-knowledge` from the same pod reaches the gateway. The trailing dot (`...cluster.local.:8080`) bypasses search-domain expansion and is the single non-obvious flag that turns "install completes but every sandbox crash-loops" into "everything works".
+</Warning>
+
+Install:
+
+```shell
+helm upgrade --install openshell \
+  oci://ghcr.io/nvidia/openshell/helm-chart \
+  --version 0.0.43 \
+  --namespace "${OPENSHELL_NAMESPACE}" \
+  --values openshift-values.yaml \
+  --wait --timeout 5m
+
+oc -n "${OPENSHELL_NAMESPACE}" rollout status statefulset/openshell --timeout=180s
+oc -n "${OPENSHELL_NAMESPACE}" get pods,svc,pvc
+oc -n "${OPENSHELL_NAMESPACE}" logs statefulset/openshell --tail=30
+```
+
+You should see `Server listening address=0.0.0.0:8080`, `Health server listening address=0.0.0.0:8081`, and `TLS disabled — accepting plaintext connections`.
+
+## Step 6 — Connect the CLI and Smoke-Test
+
+The gateway listens on a ClusterIP service. Use `oc port-forward` for evaluation. Run the port-forward in a dedicated terminal so the SSH-over-gRPC streams stay alive.
+
+```shell
+# Terminal A
+oc -n "${OPENSHELL_NAMESPACE}" port-forward svc/openshell 18080:8080
+
+# Terminal B
+openshell gateway remove openshift 2>/dev/null || true
+openshell gateway add http://127.0.0.1:18080 --name openshift
+openshell gateway select openshift
+openshell status
+```
+
+`openshell status` should print `Status: Connected` and the matching gateway `Version: 0.0.43`.
+
+Create a sandbox. For automation, prefer `sandbox exec` with stdin piped from `echo ""` rather than the interactive `sandbox create` flow:
+
+```shell
+# Use the kubectl side to confirm the Sandbox CR + pod start fine.
+oc -n "${OPENSHELL_NAMESPACE}" get sandbox,pod -w &
+WATCH=$!
+
+openshell sandbox create --name ocp-smoke --from ghcr.io/nvidia/openshell-community/sandboxes/base:latest &
+CREATE=$!
+
+# Once the CR shows Ready and the pod shows 1/1, run a non-TTY exec to verify.
+echo "" | openshell sandbox exec -n ocp-smoke -- /bin/sh -c 'id; cat /etc/os-release | head -3'
+echo "" | openshell sandbox exec -n ocp-smoke -- /bin/sh -c 'ls -la /sandbox | head -10'
+
+kill ${WATCH} 2>/dev/null
+```
+
+Expected:
+
+- `uid=998(sandbox) gid=998(sandbox)` (the sandbox container's UID 998 inside the Ubuntu 24.04 base image).
+- `/sandbox` populated with `.agents`, `.claude`, `.uv`, `.venv`, `.bashrc`, and `.workspace-initialized` (the workspace init container seeded these from the base image).
+
+Confirm OCSF logging and policy enforcement:
+
+```shell
+echo "" | openshell sandbox exec -n ocp-smoke -- \
+  /bin/sh -c 'curl -sS --max-time 5 -o /dev/null -w "%{http_code}\n" https://github.com || true'
+
+openshell logs ocp-smoke --source sandbox | tail -10
+```
+
+The curl call should fail (default `claude_code` policy does not whitelist `github.com:443`) and the sandbox log tail should contain entries like:
+
+```text
+CONFIG:APPLYING  Applying Landlock filesystem sandbox [abi:V2 compat:BestEffort ro:7 rw:3]
+CONFIG:BUILT     Landlock ruleset built [rules_applied:9 skipped:1]
+SSH:OPEN         ALLOWED
+NET:OPEN         [MED] DENIED /usr/bin/curl(...) -> github.com:443 [policy:- engine:opa] [reason:endpoint github.com:443 not in policy 'claude_code']
+```
+
+Both lines together prove OPA policy, Landlock on the RHCOS 5.14 kernel, and OCSF JSONL emission all work on OpenShift.
+
+<Warning>
+The interactive `openshell sandbox create` flow currently hangs on the local TTY when run against an OpenShift port-forwarded gateway. Use `openshell sandbox exec -n <name> -- ...` with stdin piped from `echo ""` (or `< /dev/null`) for non-interactive verification. For an interactive session use `openshell sandbox connect`, but expect TTY-related issues over `oc port-forward`; consider an Ingress/Route for production-style interactive use.
+</Warning>
+
+## Test Kata Containers
+
+The chart and CLI flows above are runc-only. To validate hardware-level sandbox isolation:
+
+1. Verify the runtime class exists: `oc get runtimeclass kata`. If it doesn't, install OpenShift sandboxed containers and verify a sample workload before involving OpenShell.
+2. Use the Python SDK to set `SandboxTemplate.runtime_class_name = "kata"`. The CLI does not yet have a `--runtime-class` flag (see PRD Gap Appendix item M1).
+
+```shell
+python - <<'PY'
+from openshell.sandbox import SandboxClient
+from openshell._proto import openshell_pb2
+
+spec = openshell_pb2.SandboxSpec(
+    template=openshell_pb2.SandboxTemplate(
+        image="ghcr.io/nvidia/openshell-community/sandboxes/base:latest",
+        runtime_class_name="kata",
+    )
+)
+
+client = SandboxClient.from_active_cluster(cluster="openshift", timeout=60)
+try:
+    sandbox = client.create(spec=spec)
+    print(f"created {sandbox.name} id={sandbox.id}")
+    client.wait_ready(sandbox.name, timeout_seconds=300)
+finally:
+    client.close()
+PY
+
+oc -n "${OPENSHELL_NAMESPACE}" get pod -l openshell.ai/managed-by=openshell \
+  -o jsonpath='{range .items[*]}{.metadata.name}{" runtimeClass="}{.spec.runtimeClassName}{"\n"}{end}'
+```
+
+The pod spec's `runtimeClassName` should be `kata`. Sandbox pods still need the `privileged` SCC even under Kata; the SCC governs what the OpenShift pod admission accepts, while the Kata kernel governs what is actually exposed to the workload.
+
+Current limitations:
+
+- The CLI has no `--runtime-class` flag.
+- The Python SDK `create()` helper does not accept a positional `name` parameter; use the generated gRPC stub directly if you need a deterministic name.
+- Landlock behavior depends on the Kata guest kernel. On guest kernels older than 5.19, expect ABI V2 BestEffort rather than every newer ABI feature.
+
+## Experimental cert-manager mTLS
+
+Use this only after the plaintext MVP path is healthy. cert-manager must be installed cluster-wide; OpenShift's `oc -n cert-manager get pods` should show `cert-manager`, `cert-manager-cainjector`, and `cert-manager-webhook` all `Running`. Add `trust-manager` if you need to inject the OpenShell CA into other workloads.
+
+Values:
+
+```yaml
+# openshift-cert-manager-values.yaml — incremental override on top of openshift-values.yaml
+server:
+  disableTls: false
+  sandboxNamespace: openshell
+  # Same trailing-dot workaround applies. For TLS, use https.
+  grpcEndpoint: "https://openshell.openshell.svc.cluster.local.:8080"
+
+pkiInitJob:
+  enabled: false
+
+certManager:
+  enabled: true
+  serverDnsNames:
+    - openshell
+    - openshell.openshell.svc
+    - openshell.openshell.svc.cluster.local
+    - localhost
+  serverIpAddresses:
+    - 127.0.0.1
+```
+
+```shell
+helm upgrade --install openshell \
+  oci://ghcr.io/nvidia/openshell/helm-chart \
+  --version 0.0.43 \
+  --namespace "${OPENSHELL_NAMESPACE}" \
+  --values openshift-values.yaml \
+  --values openshift-cert-manager-values.yaml \
+  --wait --timeout 5m
+
+oc -n "${OPENSHELL_NAMESPACE}" get certificate,secret
+oc -n "${OPENSHELL_NAMESPACE}" describe certificate openshell-server
+```
+
+Extract the client bundle manually — the CLI has no `openshell gateway setup-certs --from-cluster` command yet:
+
+```shell
+GATEWAY_NAME=openshift-mtls
+MTLS_DIR="${HOME}/.config/openshell/gateways/${GATEWAY_NAME}/mtls"
+mkdir -p "${MTLS_DIR}"
+
+oc -n "${OPENSHELL_NAMESPACE}" get secret openshell-client-tls -o jsonpath='{.data.ca\.crt}'  | base64 -d > "${MTLS_DIR}/ca.crt"
+oc -n "${OPENSHELL_NAMESPACE}" get secret openshell-client-tls -o jsonpath='{.data.tls\.crt}' | base64 -d > "${MTLS_DIR}/tls.crt"
+oc -n "${OPENSHELL_NAMESPACE}" get secret openshell-client-tls -o jsonpath='{.data.tls\.key}' | base64 -d > "${MTLS_DIR}/tls.key"
+
+oc -n "${OPENSHELL_NAMESPACE}" port-forward svc/openshell 18443:8080 &
+
+openshell gateway add https://127.0.0.1:18443 --name "${GATEWAY_NAME}"
+openshell -g "${GATEWAY_NAME}" status
+```
+
+If the CLI reports certificate validation failures, confirm the server certificate includes `127.0.0.1` or `localhost` in its SANs and that the extracted CA matches the issuing CA.
+
+## Air-Gapped Deployment
+
+Mirror at minimum:
+
+```shell
+export OPENSHELL_VERSION=0.0.43
+export INTERNAL_REGISTRY=registry.example.com/openshell
+
+skopeo copy --all docker://ghcr.io/nvidia/openshell/gateway:${OPENSHELL_VERSION}    docker://${INTERNAL_REGISTRY}/gateway:${OPENSHELL_VERSION}
+skopeo copy --all docker://ghcr.io/nvidia/openshell/supervisor:${OPENSHELL_VERSION} docker://${INTERNAL_REGISTRY}/supervisor:${OPENSHELL_VERSION}
+skopeo copy --all docker://ghcr.io/nvidia/openshell-community/sandboxes/base:latest docker://${INTERNAL_REGISTRY}/sandboxes/base:latest
+```
+
+Also mirror the Agent Sandbox manifest image(s), cert-manager (if used), the OpenShift sandboxed containers catalog (if Kata is used), the Rancher local-path-provisioner image (if you use the workaround in Step 3), and the busybox helper image the local-path-provisioner pulls.
+
+For private registries, create a pull secret and link it to both the gateway service account **and** the namespace `default` service account, because the chart does not yet expose `server.sandboxImagePullSecrets`:
+
+```shell
+oc -n "${OPENSHELL_NAMESPACE}" create secret docker-registry internal-registry \
+  --docker-server=registry.example.com \
+  --docker-username='<user>' \
+  --docker-password='<password>' \
+  --docker-email='unused@example.com'
+
+oc -n "${OPENSHELL_NAMESPACE}" secrets link openshell internal-registry --for=pull || true
+oc -n "${OPENSHELL_NAMESPACE}" secrets link default   internal-registry --for=pull
+```
+
+Values overrides:
+
+```yaml
+image:
+  repository: registry.example.com/openshell/gateway
+  tag: "0.0.43"
+supervisor:
+  image:
+    repository: registry.example.com/openshell/supervisor
+    tag: "0.0.43"
+  sideloadMethod: init-container
+server:
+  sandboxImage: registry.example.com/openshell/sandboxes/base:latest
+  grpcEndpoint: "http://openshell.openshell.svc.cluster.local.:8080"
+imagePullSecrets:
+  - name: internal-registry
+```
+
+If Helm cannot reach the OCI chart registry from the cluster operator workstation, pull the chart out-of-band and install from disk:
+
+```shell
+helm pull oci://ghcr.io/nvidia/openshell/helm-chart --version 0.0.43
+helm upgrade --install openshell ./helm-chart-0.0.43.tgz \
+  --namespace "${OPENSHELL_NAMESPACE}" \
+  --values openshift-values.yaml
+```
+
+## Gateway Per Team
+
+The only viable multi-team model today is one Helm release per team namespace. Each team gets a separate gateway database, separate PKI material (if mTLS is enabled), separate providers, and a namespace boundary.
+
+```shell
+TEAM=team-alpha
+RELEASE=openshell-${TEAM}
+NAMESPACE=openshell-${TEAM}
+
+oc new-project "${NAMESPACE}" || true
+oc label ns "${NAMESPACE}" \
+  pod-security.kubernetes.io/enforce=privileged \
+  --overwrite
+oc adm policy add-scc-to-user privileged -z default -n "${NAMESPACE}"
+
+helm upgrade --install "${RELEASE}" \
+  oci://ghcr.io/nvidia/openshell/helm-chart \
+  --version 0.0.43 \
+  --namespace "${NAMESPACE}" \
+  --values openshift-values.yaml \
+  --set server.sandboxNamespace="${NAMESPACE}" \
+  --set server.grpcEndpoint="http://openshell-${TEAM}.${NAMESPACE}.svc.cluster.local.:8080" \
+  --wait --timeout 5m
+
+oc -n "${NAMESPACE}" port-forward "svc/${RELEASE}" 8081:8080 &
+openshell gateway add http://127.0.0.1:8081 --name "${TEAM}"
+```
+
+Do not point multiple teams at a single shared gateway. Current authz is method-and-role scoped, not object-owner scoped, so any user authenticated against a shared gateway can list and operate on every other user's sandboxes and providers.
+
+## GitOps and Declarative Sandboxes
+
+The Kubernetes driver watches all Agent Sandbox CRs in its configured namespace and can create initial gateway records for CRs it sees if it can derive a sandbox ID from `openshell.ai/sandbox-id` or a `sandbox-<id>` name. This is not yet a complete GitOps surface:
+
+- The adopted gateway record has `spec: None`, so policy, provider attachments, and user intent are not faithfully reconstructed from the external CR.
+- The gateway does not create the required OpenShell supervisor environment, TLS material, and policy/provider wiring for arbitrary hand-written CRs unless the CR matches the driver-generated shape.
+- `openshell sandbox create --runtime-class kata` does not exist yet, so GitOps users cannot use the CLI to generate a declarative manifest with all fields filled in.
+
+Use API or CLI-created sandboxes for functional testing today. Treat hand-written Agent Sandbox CRs as an advanced debugging tool, not a supported production GitOps workflow.
+
+## Troubleshooting Decision Tree
+
+| Symptom | Probable cause | Action |
+|---|---|---|
+| `helm upgrade` times out, pod stuck `Pending` with `failed to provision volume ... DeadlineExceeded` | Cluster default StorageClass backend (commonly ODF Ceph) is unhealthy. | Step 3: deploy local-path-provisioner and make it default. |
+| Pod `CreateContainerConfigError`, kubelet event `container has runAsNonRoot and image has non-numeric user (nvs)` | `securityContext.runAsNonRoot: true` set together with `runAsUser: null` (the outdated docs). | Set `runAsNonRoot: null` in values. Step 5. |
+| Pod admission rejected: `violates PodSecurity ... capabilities.add` | Namespace PSA is still `restricted`. | Step 4: label namespace `pod-security.kubernetes.io/enforce=privileged`. |
+| Gateway pod logs `migration N was previously applied but is missing in the resolved migrations` | Stale SQLite database in re-used hostPath/local PV. | Step 4: wipe the data dir before reinstall. |
+| Helm install OK, gateway pod `Running`, but every sandbox crash-loops with `Policy fetch failed after 5 attempts: failed to connect to OpenShell server` | Supervisor DNS resolver crashes on auto-derived FQDN. | Step 5: set `server.grpcEndpoint: "http://openshell.openshell.svc.cluster.local.:8080"` (note trailing dot) and `helm upgrade`. |
+| `openshell sandbox exec` hangs forever in a TTY | TTY allocation over SSH-over-gRPC stalls in this lab. | Pipe stdin: `echo "" \| openshell sandbox exec ...`. |
+| `oc get sandbox` shows `Ready` then `Provisioning` repeatedly | Supervisor connecting briefly, then losing the session because it cannot resolve the gateway DNS. | Same as the Policy fetch row above — apply the `grpcEndpoint` workaround. |
+| `helm uninstall` leaves PVCs Pending forever | Stuck Ceph CSI ops. | `oc patch pvc <name> -p '{"metadata":{"finalizers":null}}' --type=merge` and re-create with the local-path SC. |
+| CLI warns `mTLS certificates found for gateway 'X'. Did you mean to use https?` even after switching to plaintext | Stale `~/.config/openshell/gateways/<name>/mtls/` from a prior install. | Remove that subdirectory before `openshell gateway add`. |
+
+## Clean Up
+
+```shell
+openshell sandbox delete --all
+helm -n "${OPENSHELL_NAMESPACE}" uninstall openshell
+oc delete project "${OPENSHELL_NAMESPACE}"
+
+# Optional: only if you installed these for this evaluation
+oc delete -f "https://github.com/kubernetes-sigs/agent-sandbox/releases/download/${AGENT_SANDBOX_VERSION}/manifest.yaml"
+oc delete -f "https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.31/deploy/local-path-storage.yaml"
+helm -n cert-manager uninstall cert-manager   # only if you installed it for this test
+```
+
+Do not remove cert-manager, Agent Sandbox, or the sandboxed containers operator if other teams use them.
+
+## What to File Upstream
+
+When reporting an OpenShift issue, include:
+
+- OpenShell chart version, CLI version, gateway image tag, supervisor image tag.
+- OpenShift version, Kubernetes version, CRI-O version, RHCOS kernel version.
+- Whether Kata was used and the exact `runtimeClassName`.
+- Helm values rendered with secrets removed.
+- `oc describe pod` for the gateway and a failing sandbox pod, plus `oc get sandbox -o yaml`.
+- Gateway logs and sandbox logs (`openshell logs <name> --source sandbox`) around the failure.
+- Whether the cluster is air-gapped and which image references were mirrored.
+- Whether the supervisor connectivity workaround in Step 5 was already applied.
+
+Known tracking issues and PRs that overlap OpenShift work include
+[#848](https://github.com/NVIDIA/OpenShell/issues/848),
+[#899](https://github.com/NVIDIA/OpenShell/issues/899),
+[#996](https://github.com/NVIDIA/OpenShell/issues/996),
+[#1012](https://github.com/NVIDIA/OpenShell/issues/1012),
+[#1015](https://github.com/NVIDIA/OpenShell/issues/1015),
+[#1018](https://github.com/NVIDIA/OpenShell/issues/1018),
+[#1020](https://github.com/NVIDIA/OpenShell/issues/1020),
+[#1024](https://github.com/NVIDIA/OpenShell/issues/1024),
+[#1026](https://github.com/NVIDIA/OpenShell/issues/1026),
+[#1030](https://github.com/NVIDIA/OpenShell/issues/1030),
+[#1145](https://github.com/NVIDIA/OpenShell/issues/1145),
+[#1250](https://github.com/NVIDIA/OpenShell/pull/1250),
+[#1326](https://github.com/NVIDIA/OpenShell/pull/1326),
+[#1363](https://github.com/NVIDIA/OpenShell/pull/1363),
+[#1390](https://github.com/NVIDIA/OpenShell/pull/1390),
+[#1404](https://github.com/NVIDIA/OpenShell/pull/1404),
+[#1414](https://github.com/NVIDIA/OpenShell/pull/1414),
+[#1436](https://github.com/NVIDIA/OpenShell/pull/1436).
